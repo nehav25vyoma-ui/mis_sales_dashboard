@@ -1,0 +1,647 @@
+MIS SALES PROJECT — USER PROMPTS
+================================
+
+Compiled chronologically from the project conversation.
+
+
+1. ORIGINAL PROJECT BRIEF
+-------------------------
+
+Create 4 buttons on the left side:
+
+1. Dashboard
+2. Upload Center — for all 4 channels
+3. Report Center
+4. Upload History
+
+Each button should be independent and should not depend on the others.
+
+First, start working with Upload Center for all 4 channels.
+
+I am building an MIS Sales Dashboard using React (Frontend), FastAPI
+(Backend), Pandas (Data Processing), and PostgreSQL (Database).
+
+Each module should be independent and reusable because the same workflow will
+later be used for SFH, Amazon, and Direct Sales.
+
+For now, implement only the DSG Upload Module.
+
+Overall workflow:
+
+1. User uploads the DSG dataset (Excel/CSV).
+2. Validate the uploaded file.
+3. Perform the existing data-cleaning process. Do not change the current
+   cleaning logic.
+4. Open the Category Review page.
+5. After Category Review is completed, open the Product Review page.
+6. Update the uploaded dataset with all user changes.
+7. Save the final reviewed dataset into PostgreSQL.
+8. Create an Upload History record.
+
+Each step should have its own page and should not depend on other modules.
+
+Step 1 — DSG Dataset Upload
+
+- Allow the user to upload one DSG dataset.
+- Validate mandatory columns.
+- Read the file using Pandas.
+- Execute the existing cleaning process.
+- Do not modify any existing business logic or calculations.
+- After successful validation, navigate to Category Review.
+
+Step 2 — Category Review
+
+Standardize all categories into:
+
+- Books
+- Web Version
+- Audio Device
+- Pen Drive
+
+Automatic category mapping:
+
+- Book → Books
+- Paperback → Books
+- Flipbook → Web Version
+- Web Version → Web Version
+- Audio Device → Audio Device
+- Pen Drive → Pen Drive
+
+Automatically updated records should not appear on Category Review.
+
+After automatic mapping, display only records whose categories do not match
+the standard categories.
+
+Display:
+
+- Order Number
+- Product Name
+- Original Category
+- Amount (Item Cost × Quantity)
+- Suggested Category dropdown
+
+Dropdown values:
+
+- Books
+- Web Version
+- Audio Device
+- Pen Drive
+
+When Update is clicked:
+
+- Update Category in the uploaded dataset.
+- Do not change Amount.
+- Remove the updated record from the review list.
+- Continue until all unknown categories are reviewed.
+- Enable Proceed to Product Review only when all records are resolved.
+
+Combo handling:
+
+- Do not automatically map Combo.
+- Display Combo separately for manual splitting.
+- User manually enters split amounts.
+- Split total must exactly equal the original amount.
+- Display a validation error when totals do not match.
+- Remove the original Combo row.
+- Create new rows for the split categories.
+- Copy every other original column.
+- Update only Category and Amount.
+
+Step 3 — Product Review
+
+- Open after Category Review.
+- Standardize product names.
+- Detect similar names using case-insensitive comparison and fuzzy matching.
+- Example: APPLE, Apple, apple, Apple090, and 909Apple represent the same
+  product.
+- Display Standard Product Name and detected variations.
+- Let the user enter the correct product name.
+- Update every matching variation in the dataset immediately.
+- Continue until all groups are reviewed.
+
+Step 4 — Save Dataset
+
+- Save the reviewed dataset into PostgreSQL.
+- Preserve all original columns.
+- Do not modify existing calculations.
+- Store updated Category and Product Name values.
+
+Step 5 — Upload History
+
+Store:
+
+- Upload ID
+- File Name
+- Channel = DSG
+- Upload Date and Time
+- Uploaded By
+- Total Records Uploaded
+- Upload Status
+
+Create separate pages:
+
+- DSG Upload
+- Category Review
+- Product Review
+- Upload Success
+
+Progress indicator:
+
+Upload → Category Review → Product Review → Save Dataset → Completed
+
+Validation:
+
+- Validate mandatory columns.
+- Show meaningful errors for invalid files.
+- Combo split total must equal the original amount.
+- Unknown categories cannot be skipped.
+- Product Review must finish before saving.
+- Saving is disabled until every review is complete.
+
+Important:
+
+- Do not change existing upload logic, cleaning logic, calculations, or report
+  generation.
+- Apply Category and Product Name changes to the uploaded dataset before
+  saving.
+- Keep the workflow modular for SFH, Amazon, and Direct Sales.
+- Follow React, FastAPI, Pandas, and PostgreSQL best practices.
+
+
+2. PROJECT CONTINUATION REQUEST
+-------------------------------
+
+Update this for my current project. We will update the project step by step.
+Only the current step has been done; now move to the next step and implement
+this project.
+
+
+3. RUNNING THE PROJECT
+----------------------
+
+How do I run the project?
+
+I received:
+
+{"message":"MIS Sales Backend is Running"}
+
+Give the full running steps because I closed all terminals. Currently the
+backend is running.
+
+I opened localhost:5173. What next?
+
+After clicking OK, nothing changes. I remain on the same page and Category
+Review is not performed.
+
+
+4. CATEGORY REVIEW UPDATE
+-------------------------
+
+Update Category Review as follows:
+
+- Standardize categories into Books, Web Version, Audio Device, and Pen Drive.
+- Automatically map:
+  - Book - Paperback → Books
+  - Web Version → Web Version
+  - Flipbook → Web Version
+  - Audio Device → Audio Device
+  - Pen Drive → Pen Drive
+- Automatically update these categories in the dataset.
+- Do not display automatically mapped rows on Category Review.
+- Display only unknown categories and Combo categories.
+- Show:
+  - Order Number
+  - Product Name
+  - Original Category
+  - Amount (Item Cost × Quantity)
+  - Suggested Category dropdown
+- Dropdown values:
+  - Books
+  - Web Version
+  - Audio Device
+  - Pen Drive
+- Update Category immediately when Update is clicked.
+- For Combo, manually split the amount across appropriate standard categories.
+- Split total must equal the original amount.
+- Replace the original Combo row with split rows.
+
+
+5. AUTOMATIC REVIEW DETECTION AND LEARNING PATH
+-----------------------------------------------
+
+Before implementing Product Review:
+
+- Standardize Learning Path to Web Version automatically.
+- Do not include Learning Path records in Category Review.
+- Automatically detect whether the uploaded dataset requires Category Review,
+  Product Review, both, or neither.
+- Display only the review pages required by the dataset.
+- Implement Product Review as the next step.
+
+
+6. PRODUCT REVIEW LAYOUT — FIRST UPDATE
+---------------------------------------
+
+In Product Review, when Detected Variations = 2, Standard Product Name should
+also provide two options.
+
+Place Detected Variations on the left and Standard Product Name on the right.
+
+
+7. PRODUCT REVIEW LAYOUT — ROW MAPPING
+--------------------------------------
+
+On the right side, provide the same number of rows as Detected Variations.
+
+- Each detected variation should occupy one row on the left.
+- The same row should contain an editable Standard Product Name field on the
+  right.
+- Provide a typing option for every Standard Product Name.
+
+
+8. PRODUCT REVIEW SAVE AND UPLOAD HISTORY
+-----------------------------------------
+
+When Update All Records is clicked:
+
+- Respond dynamically.
+- Update the original uploaded dataset.
+- After all product reviews are completed, store the reviewed dataset in
+  PostgreSQL.
+- Display the saved dataset in Upload History.
+- Standardize the DSG format in PostgreSQL.
+- The DSG upload should not accept a different dataset format.
+- Display a popup for an invalid dataset.
+- If a dataset is deleted from Upload History, delete it from PostgreSQL too.
+- Create a unique ID for every dataset to prevent duplication.
+
+
+9. PRODUCT REVIEW FEEDBACK
+--------------------------
+
+After updating, there is no response. How does the user know whether it was
+updated?
+
+After all product reviews are updated, display a clear message such as:
+
+All Product Review Done
+
+
+10. PRODUCT REVIEW WORKFLOW FIX
+-------------------------------
+
+Fix Product Review. It is not working correctly.
+
+- Make Update work the same way as Category Review.
+- When Update is clicked, immediately update Product Name in the uploaded
+  dataset.
+- Remove the updated record/group from the review list.
+- Update the pending review count at the top-right.
+- Continue until all product reviews are complete.
+- When pending count reaches zero, automatically enable or navigate to Save
+  Dataset.
+- Ensure reviewed product names are in the dataset before PostgreSQL storage.
+
+
+11. POSTGRESQL VERIFICATION QUESTIONS
+-------------------------------------
+
+How can I see the saved dataset in PostgreSQL?
+
+How can I verify SFH data in PostgreSQL?
+
+Explain the purpose of the query used to view the saved SFH dataset.
+
+Confirm that the system does not remove original columns. It should update only
+the mentioned columns, add required columns, and store the result in the
+database.
+
+How can I view row_data?
+
+Does row_data contain the modified Category and Course values?
+
+How can I properly view all column data?
+
+
+12. SFH UPLOAD WORKFLOW
+-----------------------
+
+Implement the SFH Upload workflow.
+
+After SFH upload:
+
+Category Review:
+
+- Skip manual Category Review.
+- Automatically set Category to Web Version for every record.
+- Do not display Category Review for SFH.
+
+Product Review:
+
+- Open Product Review after automatic Category update.
+- Use the Course column as Product Name.
+- Display Course values for product standardization.
+- Product Review should behave exactly like DSG:
+  - Update button
+  - Pending count
+  - Dataset update
+  - Completion flow
+
+Save Dataset:
+
+- After Product Review, save the updated dataset to PostgreSQL.
+- Ensure all Product Name changes are reflected before saving.
+- Do not change any other existing business logic or calculations.
+
+
+13. DSG KPI CARD DASHBOARD
+--------------------------
+
+Update the DSG KPI Card Dashboard.
+
+Filter behavior:
+
+Mode 1 — All Channels
+
+- Display channel-wise breakdown.
+- Future channel names:
+  - Online Sales (DSG)
+  - Website Sales (SFH)
+  - Amazon
+  - Direct Sales
+- Display only channels with data.
+- KPI headline shows the combined total.
+
+Mode 2 — Individual Channel
+
+- Display category-wise breakdown instead of channel-wise breakdown.
+- Do not repeat the selected channel name inside the breakdown.
+
+DSG KPI calculations use the reviewed DSG dataset.
+
+0 Rated Sales:
+
+- Use Country Code (Billing).
+- Initially requested logic: Country Code (Billing) ≠ INR.
+- Sum Item Cost × Quantity.
+- Subtitle: Non-INR Foreign Sales.
+
+Exempted Sales:
+
+- Category = Books.
+- Sum Item Cost × Quantity.
+- Subtitle: No tax applied.
+
+Taxable Amount:
+
+- Categories:
+  - Web Version
+  - Audio Device
+  - Pen Drive
+- Sum Item Cost × Quantity.
+- Subtitle: Audio Device, Pen Drive, Web Version.
+
+Sales as per P&L:
+
+Sales as per P&L = 0 Rated Sales + Exempted Sales + Taxable Amount
+
+Subtitle: 0 Rated + Exempted + Taxable.
+
+Breakdown for All Channels:
+
+- Online Sales (DSG)
+- Website Sales (SFH)
+- Amazon
+- Direct Sales
+- Total
+
+Display only channels containing data.
+
+Breakdown for Online Sales (DSG):
+
+0 Rated Sales:
+
+- Web Version
+- Audio Device
+- Pen Drive
+- Total
+
+Exempted Sales:
+
+- Books
+- Total
+
+Taxable Amount:
+
+- Web Version
+- Audio Device
+- Pen Drive
+- Total
+
+Sales as per P&L:
+
+- 0 Rated Sales
+- Exempted Sales
+- Taxable Amount
+- Total
+
+Trend:
+
+- All Channels → combined monthly trend.
+- Online Sales (DSG) → DSG monthly trend.
+- Keep existing sparkline design.
+- No axes or gridlines.
+
+
+14. CHANNEL-SPECIFIC AMOUNT LOGIC
+---------------------------------
+
+Update Amount calculations based on the selected channel.
+
+DSG:
+
+- Always use Item Cost × Quantity as Amount.
+- All KPIs, category totals, product totals, and reports must use it.
+
+SFH:
+
+- Determine Amount using Currency.
+- If Currency contains the literal ₹ symbol:
+  - Treat it as INR.
+  - Use Without Tax Total as Amount.
+- If Currency contains any value other than ₹:
+  - Treat it as Non-INR.
+  - Use Earnings as Amount.
+- Do not confuse the text INR with the ₹ symbol.
+- Apply this consistently across KPIs, reports, tables, and calculations.
+- Do not change other business logic.
+
+
+15. FINAL DSG KPI CALCULATION
+-----------------------------
+
+Update DSG KPI calculations using the reviewed DSG dataset.
+
+Always use Item Cost × Quantity.
+
+0 Rated Sales:
+
+- Use Country Code (Billing).
+- Exclude records where Country Code (Billing) = IN.
+- Include every other country code.
+- Sum Item Cost × Quantity.
+
+Exempted Sales:
+
+- Category = Books.
+- Sum Item Cost × Quantity.
+
+Taxable Amount:
+
+- Categories:
+  - Web Version
+  - Audio Device
+  - Pen Drive
+- Sum Item Cost × Quantity.
+
+Sales as per P&L:
+
+Sales as per P&L = 0 Rated Sales + Exempted Sales + Taxable Amount
+
+Important:
+
+- Use the reviewed DSG dataset.
+- Use updated Category values.
+- Use Item Cost × Quantity.
+- All KPI totals and expanded breakdowns must use the same logic.
+- Breakdown totals must exactly match headline values.
+- Do not modify other business logic or report generation.
+
+
+16. DSG CALCULATION CORRECTION
+------------------------------
+
+The DSG calculation is wrong.
+
+Displayed value: 1,09,728.98
+
+Actual value: 103067
+
+Review and correct the calculation.
+
+
+17. NUMBER FORMATTING
+---------------------
+
+Keep all numbers as whole numbers.
+
+
+18. PROMPT EXPORT
+-----------------
+
+Whatever prompts I have provided, share them in TXT format.
+
+
+19. ONGOING PROMPT STORAGE RULE
+-------------------------------
+
+Every time I provide a new prompt, store it in TXT format.
+
+Append every future user prompt chronologically to:
+
+docs/project-prompts.txt
+
+
+20. DEDICATED PROMPT FOLDER
+---------------------------
+
+Create a folder for the prompts and keep all prompts inside it in TXT format.
+
+New prompt storage location:
+
+docs/prompts/project-prompts.txt
+
+
+21. PROMPT FOLDER NAME
+----------------------
+
+Can you tell me the folder name?
+
+
+22. KPI SPARKLINE ENHANCEMENT
+-----------------------------
+
+Enhance the sparkline inside every KPI card:
+
+1. Add a delta badge beside the headline showing latest-period versus
+   previous-period percentage change.
+   - Positive: green with up-arrow styling.
+   - Negative: orange/red.
+   - No change or insufficient prior data: neutral gray with "—".
+   - Format percentages to one decimal place, such as +7.2% or -3.1%.
+
+2. Match sparkline color to direction:
+   - Green for upward trend.
+   - Orange/red for downward trend.
+   - Gray for flat or neutral.
+
+3. Display one solid marker only on the final data point. Its color must match
+   the line.
+
+4. Keep the chart minimal:
+   - No axes.
+   - No gridlines.
+   - No legend.
+
+5. For all-zero or insufficient trends, show a flat dashed line or an em dash
+   rather than a misleading moving line.
+
+6. Synchronize trend and delta with channel filters:
+   - All Channels uses the combined trend.
+   - A selected channel uses only its own trend.
+
+The time series should contain at least two periods for delta calculation and
+ideally six or more for a meaningful trend shape.
+
+
+23. INDEPENDENT TIME-GRAIN FILTER
+---------------------------------
+
+Add a second independent KPI Dashboard filter for time grain alongside the
+channel filter.
+
+Time-grain options:
+
+- Monthly
+- Quarterly
+- Yearly
+
+Default to Monthly, or the grain with the most complete available data.
+
+Both filters apply together. For example, Website Sales plus Quarterly shows
+Website Sales data aggregated by quarter.
+
+Aggregation:
+
+- Monthly: one point per month.
+- Quarterly: sum the three months in each calendar quarter.
+- Yearly: sum all months in each year.
+- Filter by channel first, then aggregate by time grain.
+
+Sparkline and delta:
+
+- Plot all aggregated points available for the selected grain.
+- Delta always compares the latest aggregated point with the immediately
+  previous aggregated point at that grain.
+- If fewer than two aggregated points exist, hide both sparkline and delta
+  badge.
+- Display "Not enough data at this grain yet" instead.
+
+Card dimensions must remain fixed regardless of filter selection or data
+volume.
+
+Show Channel and Time Grain as two clearly labelled, independent control
+groups.
+
+Keep monthly data as the single source of truth and derive quarterly/yearly
+aggregations rather than storing separate copies.
