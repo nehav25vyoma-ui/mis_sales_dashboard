@@ -615,6 +615,14 @@ function DashboardPage() {
     query.set('comparison_year', String(comparisonYear))
     fetch(`/api/dashboard/kpis?${query}`)
       .then(async (response) => {
+        const contentType = response.headers.get('content-type') ?? ''
+        if (!contentType.includes('application/json')) {
+          throw new Error(
+            response.ok
+              ? 'The API returned an invalid response.'
+              : `The API is unavailable (HTTP ${response.status}). Check the deployment configuration.`,
+          )
+        }
         const result = await response.json()
         if (!response.ok) throw new Error(result.detail ?? 'Unable to load dashboard KPIs.')
         return result

@@ -29,7 +29,13 @@ def home():
 
 
 @app.get("/db-test")
+@app.get("/api/db-test")
 def db_test():
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
     return {"message": "Database Connected Successfully"}
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
