@@ -2,7 +2,6 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from app.database.database import engine
-from app.database.database import Base
 from app.database import models  # noqa: F401
 from app.uploads.dsg import router as upload_router
 from app.uploads.sfh import router as sfh_upload_router
@@ -16,11 +15,6 @@ app.include_router(sfh_upload_router)
 app.include_router(dashboard_router)
 app.include_router(direct_sales_router)
 app.include_router(reports_router)
-
-
-@app.on_event("startup")
-def create_database_tables() -> None:
-    Base.metadata.create_all(bind=engine)
 
 
 @app.get("/")
