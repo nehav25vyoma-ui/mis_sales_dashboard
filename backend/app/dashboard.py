@@ -63,6 +63,26 @@ def _direct_amount(row: DirectSalesDatasetRow) -> float:
     # Sales amount mapping also use the correct net-of-tax business value.
     value = _row_value(row.row_data, ("without tax total",))
     return _number(value if value is not None else row.amount)
+
+
+def _direct_sales_channel(row: DirectSalesDatasetRow) -> str:
+    """Return the shared dashboard channel mapping for a Direct Sales row."""
+    private_notes = str(_row_value(row.row_data, ("private notes",)) or "").casefold()
+    # Private Notes is authoritative for the two named channels. Checking it
+    # first also classifies datasets saved before Language Lab was introduced.
+    if "language lab" in private_notes:
+        return "Language Lab"
+    classification = str(
+        _row_value(row.row_data, ("sales classification",))
+        or (
+            "Stall Sales"
+            if "stall" in private_notes
+            else "Bulk Sales"
+            if _number(_row_value(row.row_data, ("mapped quantity",))) > 10
+            else "Direct Sales"
+        )
+    )
+    return classification if classification in {"Direct Sales", "Stall Sales", "Bulk Sales", "Language Lab"} else "Direct Sales"
     try:
         return float(str(value).replace(",", "").replace("₹", "").strip())
     except (TypeError, ValueError):
@@ -291,7 +311,7 @@ def _direct_sales_classification(
             row_year == selected_year and row_month <= cutoff
         )
 
-    totals = {"Direct Sales": 0.0, "Stall Sales": 0.0, "Bulk Sales": 0.0}
+    totals = {"Direct Sales": 0.0, "Stall Sales": 0.0, "Bulk Sales": 0.0, "Language Lab": 0.0}
     with SessionLocal() as database:
         upload_dates = {
             item.upload_id: item.uploaded_at
@@ -301,23 +321,29 @@ def _direct_sales_classification(
             month = _month(row.row_data, upload_dates.get(row.upload_id, current))
             if not included(month):
                 continue
-            classification = str(
-                _row_value(row.row_data, ("sales classification",))
-                or (
-                    "Stall Sales"
-                    if "stall" in str(
-                        _row_value(row.row_data, ("private notes",)) or ""
-                    ).casefold()
-                    else "Bulk Sales"
-                    if _number(_row_value(row.row_data, ("mapped quantity",))) > 10
-                    else "Direct Sales"
-                )
-            )
-            if classification not in totals:
-                classification = "Direct Sales"
+            classification = _direct_sales_channel(row)
             totals[classification] += _direct_amount(row)
-    totals["Total Direct Sales"] = sum(totals.values())
+    totals["Total Direct Sales"] = sum(
+        totals[channel] for channel in ("Direct Sales", "Stall Sales", "Bulk Sales")
+    )
     return {key: _rounded(value) for key, value in totals.items()}
+
+
+def _language_lab_monthly() -> dict[str, float]:
+    """Return Language Lab sales by month for Grand Total sales trends."""
+    totals: dict[str, float] = defaultdict(float)
+    current = datetime.now()
+    with SessionLocal() as database:
+        upload_dates = {
+            item.upload_id: item.uploaded_at
+            for item in database.query(UploadHistory).all()
+        }
+        for row in database.query(DirectSalesDatasetRow).all():
+            if _direct_sales_channel(row) != "Language Lab":
+                continue
+            month = _month(row.row_data, upload_dates.get(row.upload_id, current))
+            totals[month] += _direct_amount(row)
+    return totals
 
 
 def _period_pnl(
@@ -818,12 +844,14 @@ def dashboard_kpis(
                 "Direct Sales": 0.0,
                 "Stall Sales": 0.0,
                 "Bulk Sales": 0.0,
+                "Language Lab": 0.0,
                 "Total Direct Sales": 0.0,
             },
             "comparison": {
                 "Direct Sales": 0.0,
                 "Stall Sales": 0.0,
                 "Bulk Sales": 0.0,
+                "Language Lab": 0.0,
                 "Total Direct Sales": 0.0,
             },
         }
@@ -836,7 +864,7 @@ def dashboard_kpis(
             "Stall Sales": direct_values["Stall Sales"],
             "Direct Sales": direct_values["Direct Sales"],
             "Bulk Sales": direct_values["Bulk Sales"],
-            "Language Lab": 0.0,
+            "Language Lab": direct_values["Language Lab"],
             "OTT": 0.0,
         }
         values["Total Sales"] = _rounded(
@@ -926,19 +954,30 @@ def dashboard_kpis(
         sales_trend = {
             "mode": "channel",
             "points": [
-                {"label": labels[key], "value": _rounded(period_metrics[key]["pnl"])}
+                {
+                    "label": labels[key],
+                    "value": _rounded(
+                        period_metrics[key]["pnl"]
+                        + (
+                            direct_sales_performance["current"]["Language Lab"]
+                            if key == "direct"
+                            else 0.0
+                        )
+                    ),
+                }
                 for key in ("dsg", "sfh", "direct")
                 if key in period_metrics
             ],
         }
     else:
+        language_lab_monthly = _language_lab_monthly() if channel == "direct" else {}
         month_points = []
         for month_key, values in sorted(available[channel]["monthly"].items()):
             row_year, row_month = (int(value) for value in month_key.split("-"))
             if row_year == primary_year:
                 month_points.append({
                     "label": datetime(row_year, row_month, 1).strftime("%b %Y"),
-                    "value": _rounded(values["pnl"]),
+                    "value": _rounded(values["pnl"] + language_lab_monthly.get(month_key, 0.0)),
                 })
         sales_trend = {"mode": "month", "points": month_points}
     return {

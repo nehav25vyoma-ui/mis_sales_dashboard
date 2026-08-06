@@ -94,6 +94,31 @@ type TimeSelection = {
   period: string
 }
 
+type DashboardFilters = {
+  channel: string
+  time: TimeSelection
+  year: number
+  comparison: TimeSelection
+  comparisonYear: number
+}
+
+const DASHBOARD_FILTERS_KEY = 'mis-sales-dashboard-filters'
+
+function savedDashboardFilters(fallback: DashboardFilters): DashboardFilters {
+  try {
+    const saved = JSON.parse(localStorage.getItem(DASHBOARD_FILTERS_KEY) ?? '') as Partial<DashboardFilters>
+    const grains = new Set(['monthly', 'quarterly', 'yearly'])
+    if (
+      typeof saved.channel === 'string'
+      && saved.time && grains.has(saved.time.grain) && typeof saved.time.period === 'string'
+      && Number.isInteger(saved.year)
+      && saved.comparison && grains.has(saved.comparison.grain) && typeof saved.comparison.period === 'string'
+      && Number.isInteger(saved.comparisonYear)
+    ) return saved as DashboardFilters
+  } catch { /* Use current-period defaults when no valid saved filters exist. */ }
+  return fallback
+}
+
 const months = [
   'January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December',
@@ -166,6 +191,23 @@ function downloadCsv(filename: string, headers: string[], rows: (string | number
   URL.revokeObjectURL(url)
 }
 
+const reportPercentage = (value: number) => `${Math.round(value)}%`
+
+function reconciledWholeValues(values: number[], target: number): number[] {
+  const displayed = values.map((value) => Math.round(value))
+  const difference = Math.round(target) - displayed.reduce((sum, value) => sum + value, 0)
+  if (!difference || !values.length) return displayed
+  const errors = values.map((value, index) => value - displayed[index])
+  const direction = difference > 0 ? 1 : -1
+  const order = values.map((_, index) => index).sort((left, right) =>
+    difference > 0 ? errors[right] - errors[left] : errors[left] - errors[right],
+  )
+  for (let offset = 0; offset < Math.abs(difference); offset += 1) {
+    displayed[order[offset % order.length]] += direction
+  }
+  return displayed
+}
+
 function Icon({ name, size = 20 }: { name: string; size?: number }) {
   const paths: Record<string, React.ReactNode> = {
     grid: <><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></>,
@@ -192,7 +234,16 @@ function Placeholder({ title }: { title: string }) {
   )
 }
 
-type ReportType = 'summary' | 'channel' | 'category' | 'product'
+type ReportType = 'summary' | 'channel' | 'category' | 'product' | 'direct-sales-overview'
+
+function MultiCheckFilter({ label, options, selected, onChange }: { label: string; options: { value: string; label: string }[]; selected: string[]; onChange: (values: string[]) => void }) {
+  const selectedSet = new Set(selected)
+  return <fieldset className="multi-check-filter">
+    <legend>{label}</legend>
+    <div className="multi-check-actions"><button type="button" onClick={() => onChange(options.map((option) => option.value))}>Select all</button><button type="button" onClick={() => onChange([])}>Clear</button></div>
+    <div className="multi-check-options">{options.map((option) => <label key={option.value}><input type="checkbox" checked={selectedSet.has(option.value)} onChange={() => onChange(selectedSet.has(option.value) ? selected.filter((value) => value !== option.value) : [...selected, option.value])} /><span>{option.label}</span></label>)}</div>
+  </fieldset>
+}
 
 function ReportCenter() {
   const today = new Date()
@@ -200,10 +251,20 @@ function ReportCenter() {
   const [month, setMonth] = useState(String(today.getMonth() + 1))
   const [year, setYear] = useState(today.getFullYear())
   const [reportType, setReportType] = useState<ReportType>('summary')
+  const [directOptions, setDirectOptions] = useState<{ years: number[]; months: number[]; types: string[]; products: string[] } | null>(null)
+  const [directYears, setDirectYears] = useState<string[]>([])
+  const [directMonths, setDirectMonths] = useState<string[]>([])
+  const [directTypes, setDirectTypes] = useState<string[]>([])
+  const [directProducts, setDirectProducts] = useState<string[]>([])
+  const [directPreview, setDirectPreview] = useState<{ row_count: number; source_records: number; totals: Record<string, number>; overall_total: number; validated: boolean } | null>(null)
+  const [directError, setDirectError] = useState('')
+  const [directLoading, setDirectLoading] = useState(false)
   const reportNames: Record<ReportType, string> = {
     summary: 'Summary Report', channel: 'Channel Wise Performance Report',
     category: 'Category Wise Performance Report', product: 'Product Wise Performance Report',
+    'direct-sales-overview': 'Direct Sales Overview',
   }
+  const isDirectOverview = reportType === 'direct-sales-overview'
   const selectedMonths = month.split(',').filter(Boolean).map(Number).sort((a, b) => a - b)
   const periodLabel = grain === 'monthly'
     ? `${selectedMonths.map((value) => months[value - 1].slice(0, 3)).join(', ')} - ${String(year).slice(-2)}`
@@ -212,21 +273,102 @@ function ReportCenter() {
     const params = new URLSearchParams({ grain, period: grain === 'monthly' ? month : String(year), year: String(year), report_type: reportType, dataset })
     window.location.assign(`/api/reports/download?${params}`)
   }
+  const directParams = () => {
+    const params = new URLSearchParams()
+    directYears.forEach((value) => params.append('years', value))
+    directMonths.forEach((value) => params.append('months', value))
+    directTypes.forEach((value) => params.append('types', value))
+    if (directProducts.length !== directOptions?.products.length) {
+      directProducts.forEach((value) => params.append('products', value))
+    }
+    return params
+  }
+  useEffect(() => {
+    fetch('/api/reports/direct-sales-overview/options')
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error('Unable to load Direct Sales report filters.')))
+      .then((options) => {
+        setDirectOptions(options)
+        setDirectYears(options.years.length ? [String(options.years[0])] : [])
+        setDirectMonths(options.months.map(String))
+        setDirectTypes(options.types)
+        setDirectProducts(options.products)
+      })
+      .catch((reason) => setDirectError(reason instanceof Error ? reason.message : 'Unable to load Direct Sales report filters.'))
+  }, [])
+  useEffect(() => {
+    if (!isDirectOverview || !directYears.length || !directMonths.length || !directTypes.length || !directProducts.length) {
+      setDirectPreview(null)
+      return
+    }
+    const controller = new AbortController()
+    setDirectLoading(true)
+    setDirectError('')
+    fetch(`/api/reports/direct-sales-overview/preview?${directParams()}`, { signal: controller.signal })
+      .then(async (response) => {
+        const result = await response.json()
+        if (!response.ok) throw new Error(result.detail ?? 'Direct Sales report validation failed.')
+        setDirectPreview(result)
+      })
+      .catch((reason) => {
+        if (reason instanceof DOMException && reason.name === 'AbortError') return
+        setDirectPreview(null)
+        setDirectError(reason instanceof Error ? reason.message : 'Direct Sales report validation failed.')
+      })
+      .finally(() => setDirectLoading(false))
+    return () => controller.abort()
+  }, [isDirectOverview, directYears, directMonths, directTypes, directProducts])
+  const downloadDirectOverview = async () => {
+    if (!directPreview?.validated) return
+    setDirectLoading(true)
+    setDirectError('')
+    try {
+      const response = await fetch(`/api/reports/direct-sales-overview/download?${directParams()}`)
+      if (!response.ok) {
+        const result = await response.json()
+        throw new Error(result.detail ?? 'Direct Sales Overview could not be downloaded.')
+      }
+      const url = URL.createObjectURL(await response.blob())
+      const link = document.createElement('a')
+      link.href = url
+      link.download = 'direct-sales-overview.csv'
+      link.click()
+      URL.revokeObjectURL(url)
+    } catch (reason) {
+      setDirectError(reason instanceof Error ? reason.message : 'Direct Sales Overview could not be downloaded.')
+    } finally {
+      setDirectLoading(false)
+    }
+  }
 
   return <div className="content report-center">
     <section className="intro"><div><span className="section-kicker">Reporting & exports</span><h2>Sales Report Center</h2><p>Build monthly or yearly MIS reports and download filtered source data or a presentation-ready Excel workbook.</p></div></section>
     <section className="report-filter-card">
       <div className="report-filter-grid">
-        <label><span>Period type</span><select value={grain} onChange={(event) => setGrain(event.target.value as 'monthly' | 'yearly')}><option value="monthly">Monthly</option><option value="yearly">Yearly</option></select></label>
+        {!isDirectOverview && <><label><span>Period type</span><select value={grain} onChange={(event) => setGrain(event.target.value as 'monthly' | 'yearly')}><option value="monthly">Monthly</option><option value="yearly">Yearly</option></select></label>
         {grain === 'monthly' && <label><span>Month (single or multiple)</span><MonthChecklistDropdown value={month} onChange={setMonth} /></label>}
-        <label><span>Year</span><select value={year} onChange={(event) => setYear(Number(event.target.value))}>{Array.from({ length: 6 }, (_, index) => today.getFullYear() - index).map((value) => <option key={value}>{value}</option>)}</select></label>
+        <label><span>Year</span><select value={year} onChange={(event) => setYear(Number(event.target.value))}>{Array.from({ length: 6 }, (_, index) => today.getFullYear() - index).map((value) => <option key={value}>{value}</option>)}</select></label></>}
         <label className="report-type-field"><span>Report</span><select value={reportType} onChange={(event) => setReportType(event.target.value as ReportType)}>{Object.entries(reportNames).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
       </div>
+      {isDirectOverview && directOptions && <div className="direct-overview-filters">
+        <MultiCheckFilter label="Year" options={directOptions.years.map((value) => ({ value: String(value), label: String(value) }))} selected={directYears} onChange={setDirectYears} />
+        <MultiCheckFilter label="Month" options={directOptions.months.map((value) => ({ value: String(value), label: months[value - 1] }))} selected={directMonths} onChange={setDirectMonths} />
+        <MultiCheckFilter label="Type" options={directOptions.types.map((value) => ({ value, label: value }))} selected={directTypes} onChange={setDirectTypes} />
+        <MultiCheckFilter label="Product" options={directOptions.products.map((value) => ({ value, label: value }))} selected={directProducts} onChange={setDirectProducts} />
+      </div>}
     </section>
-    <section className="report-preview-card report-export-card">
+    {isDirectOverview && <section className="report-preview-card report-export-card">
+      <div className="report-preview-head"><div><span className="section-kicker">Validated CSV export</span><h3>Direct Sales Overview</h3><p>Uses the same Bulk, Retail, Stall, and Language Lab mapping as Channel Wise Performance.</p></div><span className="format-pill">CSV</span></div>
+      {directError && <div className="error-message">{directError}</div>}
+      {directPreview?.validated && <div className="direct-overview-validation">
+        {directOptions?.types.map((type) => <div key={type}><span>{type}</span><strong>{Math.round(directPreview.totals[type] ?? 0).toLocaleString('en-IN')}</strong></div>)}
+        <div className="overall"><span>Overall Total</span><strong>{Math.round(directPreview.overall_total).toLocaleString('en-IN')}</strong></div>
+      </div>}
+      <div className="report-download-footer"><div><strong>{directPreview?.validated ? 'Reconciled and ready' : directLoading ? 'Validating report…' : 'Select filters to validate'}</strong><span>{directPreview ? `${directPreview.row_count.toLocaleString('en-IN')} unique rows from ${directPreview.source_records.toLocaleString('en-IN')} records.` : 'Download is enabled only after dashboard reconciliation succeeds.'}</span></div><button className="primary-download" disabled={!directPreview?.validated || directLoading} onClick={() => { void downloadDirectOverview() }}>↓ Download CSV</button></div>
+    </section>}
+    {!isDirectOverview && <section className="report-preview-card report-export-card">
       <div className="report-preview-head"><div><span className="section-kicker">Excel export</span><h3>{reportNames[reportType]}</h3><p>{periodLabel} · The requested report formatting will be applied inside the downloaded Excel file.</p></div><span className="format-pill">XLSX</span></div>
       <div className="report-download-footer"><div><strong>Ready to export</strong><span>Download the selected report or its standardized cleaned dataset.</span></div><div><button className="secondary-download" onClick={() => download('report')}>↓ Download Report</button><button className="primary-download" onClick={() => download('clean')}>↓ Download Cleaned Dataset</button></div></div>
-    </section>
+    </section>}
   </div>
 }
 
@@ -241,7 +383,7 @@ function trendDetails(values: number[]): { direction: TrendDirection; label: str
   if (Math.abs(change) < 0.05) return { direction: 'neutral', label: '0.0%' }
   return {
     direction: change > 0 ? 'up' : 'down',
-    label: `${change > 0 ? '+' : ''}${change.toFixed(1)}%`,
+    label: `${change > 0 ? '+' : ''}${Math.round(change)}%`,
   }
 }
 
@@ -416,34 +558,74 @@ function CategoryWiseSales({
   rows: DashboardData['category_performance']
   loading: boolean
 }) {
-  const colors = ['#dc613e', '#8174e8', '#28a17b', '#d84e79']
-  const totalPlan = rows.reduce((sum, row) => sum + row.current.plan, 0)
-  const totalActual = rows.reduce((sum, row) => sum + row.current.actual, 0)
+  const [activeCategory, setActiveCategory] = useState<string | null>(null)
+  const colors = ['#ff7424', '#7966ea', '#20a978', '#ed2757']
+  const totalPlan = rows.reduce((sum, row) => sum + Math.round(row.current.plan), 0)
+  const totalActual = rows.reduce((sum, row) => sum + Math.round(row.current.actual), 0)
   const formatMoney = (value: number) => `₹${Math.round(value).toLocaleString('en-IN')}`
+  const centerX = 130
+  const centerY = 118
+  const outerRadius = 90
+  const innerRadius = 48
+  const calloutThreshold = 5
+  const donutPercentage = (value: number) => value > 0 && Math.round(value) === 0 ? '<1%' : `${Math.round(value)}%`
   let startAngle = -90
   const point = (angle: number, radius: number) => {
     const radians = (angle * Math.PI) / 180
-    return { x: 110 + radius * Math.cos(radians), y: 110 + radius * Math.sin(radians) }
+    return { x: centerX + radius * Math.cos(radians), y: centerY + radius * Math.sin(radians) }
   }
   const slices = rows.map((row, index) => {
     const percentage = totalActual ? (row.current.actual / totalActual) * 100 : 0
     const sweep = (percentage / 100) * 360
     const endAngle = startAngle + sweep
-    const start = point(startAngle, 88)
-    const end = point(endAngle, 88)
-    const label = point(startAngle + sweep / 2, 56)
+    const middleAngle = startAngle + sweep / 2
+    const outerStart = point(startAngle, outerRadius)
+    const outerEnd = point(endAngle, outerRadius)
+    const innerStart = point(startAngle, innerRadius)
+    const innerEnd = point(endAngle, innerRadius)
+    const label = point(middleAngle, (outerRadius + innerRadius) / 2)
+    const leaderStart = point(middleAngle, outerRadius)
+    const leaderElbowRaw = point(middleAngle, outerRadius + 17)
+    const side = Math.cos((middleAngle * Math.PI) / 180) >= 0 ? 1 : -1
+    const leaderElbow = { x: leaderElbowRaw.x, y: Math.min(Math.max(leaderElbowRaw.y, 12), 224) }
+    const leaderEnd = { x: leaderElbow.x + side * 18, y: leaderElbow.y }
     const path = sweep >= 359.999
       ? ''
-      : `M 110 110 L ${start.x} ${start.y} A 88 88 0 ${sweep > 180 ? 1 : 0} 1 ${end.x} ${end.y} Z`
-    const slice = { row, color: colors[index], percentage, path, label, full: sweep >= 359.999 }
+      : `M ${outerStart.x} ${outerStart.y} A ${outerRadius} ${outerRadius} 0 ${sweep > 180 ? 1 : 0} 1 ${outerEnd.x} ${outerEnd.y} L ${innerEnd.x} ${innerEnd.y} A ${innerRadius} ${innerRadius} 0 ${sweep > 180 ? 1 : 0} 0 ${innerStart.x} ${innerStart.y} Z`
+    const slice = { row, color: colors[index], percentage, path, label, leaderStart, leaderElbow, leaderEnd, side, full: sweep >= 359.999 }
     startAngle = endAngle
     return slice
+  })
+  ;([-1, 1] as const).forEach((side) => {
+    const callouts = slices
+      .filter((slice) => slice.percentage > 0 && slice.percentage < calloutThreshold && slice.side === side)
+      .sort((a, b) => a.leaderElbow.y - b.leaderElbow.y)
+    const minimumY = 14
+    const maximumY = 222
+    const minimumGap = 18
+    callouts.forEach((slice, index) => {
+      const previousY = index ? callouts[index - 1].leaderEnd.y : minimumY - minimumGap
+      const nextY = Math.max(slice.leaderElbow.y, previousY + minimumGap)
+      slice.leaderElbow.x = side > 0
+        ? Math.max(slice.leaderStart.x + 10, centerX + 22)
+        : Math.min(slice.leaderStart.x - 10, centerX - 22)
+      slice.leaderElbow.y = nextY
+      slice.leaderEnd.y = nextY
+      slice.leaderEnd.x = side > 0 ? 226 : 34
+    })
+    for (let index = callouts.length - 1; index >= 0; index -= 1) {
+      const nextY = index === callouts.length - 1 ? maximumY + minimumGap : callouts[index + 1].leaderEnd.y
+      const adjustedY = Math.min(callouts[index].leaderEnd.y, nextY - minimumGap)
+      callouts[index].leaderElbow.y = adjustedY
+      callouts[index].leaderEnd.y = adjustedY
+    }
   })
   const leader = rows.reduce<typeof rows[number] | null>(
     (highest, row) => !highest || row.current.actual > highest.current.actual ? row : highest,
     null,
   )
   const leaderPercentage = leader && totalActual ? (leader.current.actual / totalActual) * 100 : 0
+  const activeSlice = slices.find((slice) => slice.row.category === activeCategory) ?? null
 
   return <section className={`category-sales-visual ${loading ? 'is-loading' : ''}`}>
     <div className="category-performance-head">
@@ -458,7 +640,7 @@ function CategoryWiseSales({
               <th>{row.category}</th>
               <td>{formatMoney(row.current.plan)}</td>
               <td>{formatMoney(row.current.actual)}</td>
-              <td>{totalActual ? ((row.current.actual / totalActual) * 100).toFixed(1) : '0.0'}%</td>
+              <td>{totalActual ? Math.round((row.current.actual / totalActual) * 100) : 0}%</td>
             </tr>)}
             <tr className="performance-total"><th>Total</th><td>{formatMoney(totalPlan)}</td><td>{formatMoney(totalActual)}</td><td>{totalActual ? '100%' : '0%'}</td></tr>
           </tbody>
@@ -468,18 +650,38 @@ function CategoryWiseSales({
         <div className="category-pie-legend">
           {slices.map((slice) => <span key={slice.row.category}><i style={{ background: slice.color }} />{slice.row.category}</span>)}
         </div>
-        {totalActual > 0 ? <svg className="category-pie" viewBox="0 0 220 220" role="img" aria-label="Category actual sales contribution pie chart">
-          {slices.filter((slice) => slice.row.current.actual > 0).map((slice) => <g key={slice.row.category}>
-            {slice.full ? <circle cx="110" cy="110" r="88" fill={slice.color} /> : <path d={slice.path} fill={slice.color} />}
-            {slice.percentage >= 5 && <text x={slice.label.x} y={slice.label.y} textAnchor="middle" dominantBaseline="middle">{Math.round(slice.percentage)}%</text>}
+        {totalActual > 0 ? <svg className="category-pie" viewBox="0 0 260 236" role="img" aria-label="Category actual sales contribution donut chart" onMouseLeave={() => setActiveCategory(null)}>
+          <defs><filter id="donut-center-shadow" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="2" stdDeviation="4" floodColor="#17213a" floodOpacity=".12" /></filter></defs>
+          {slices.filter((slice) => slice.row.current.actual > 0).map((slice) => <g
+            className={`donut-segment ${activeCategory === slice.row.category ? 'is-active' : activeCategory ? 'is-muted' : ''}`}
+            key={slice.row.category}
+            role="button"
+            tabIndex={0}
+            aria-label={`${slice.row.category}: ${formatMoney(slice.row.current.actual)}, ${donutPercentage(slice.percentage)}`}
+            onMouseEnter={() => setActiveCategory(slice.row.category)}
+            onFocus={() => setActiveCategory(slice.row.category)}
+            onBlur={() => setActiveCategory(null)}
+          >
+            {slice.full ? <circle cx={centerX} cy={centerY} r={(outerRadius + innerRadius) / 2} fill="none" stroke={slice.color} strokeWidth={outerRadius - innerRadius} /> : <path d={slice.path} fill={slice.color} />}
+            {slice.percentage >= calloutThreshold
+              ? <text className="donut-slice-label" x={slice.label.x} y={slice.label.y} textAnchor="middle" dominantBaseline="middle">{donutPercentage(slice.percentage)}</text>
+              : <g className="donut-callout">
+                  <polyline points={`${slice.leaderStart.x},${slice.leaderStart.y} ${slice.leaderElbow.x},${slice.leaderElbow.y} ${slice.leaderEnd.x},${slice.leaderEnd.y}`} fill="none" stroke={slice.color} />
+                  <circle cx={slice.leaderEnd.x} cy={slice.leaderEnd.y} r="2.5" fill={slice.color} />
+                  <text x={slice.leaderEnd.x + slice.side * 6} y={slice.leaderEnd.y} textAnchor={slice.side > 0 ? 'start' : 'end'} dominantBaseline="middle">{donutPercentage(slice.percentage)}</text>
+                </g>}
           </g>)}
+          <circle className="donut-center" cx={centerX} cy={centerY} r={innerRadius - 1} filter="url(#donut-center-shadow)" />
+          <text className="donut-center-title" x={centerX} y={centerY - (activeSlice ? 13 : 7)} textAnchor="middle">{activeSlice?.row.category ?? 'Total Sales'}</text>
+          <text className="donut-center-value" x={centerX} y={centerY + (activeSlice ? 5 : 13)} textAnchor="middle">{formatMoney(activeSlice?.row.current.actual ?? totalActual)}</text>
+          {activeSlice && <text className="donut-center-percent" x={centerX} y={centerY + 20} textAnchor="middle">{donutPercentage(activeSlice.percentage)}</text>}
         </svg> : <div className="category-pie-empty">No sales data for this selection</div>}
       </div>
     </div>
     <div className="category-sales-insight">
       <span>✦</span>
       <p>{leader && totalActual > 0
-        ? <><strong>{leader.category}</strong> contributed <strong>{formatMoney(leader.current.actual)}</strong>, accounting for <strong>{leaderPercentage.toFixed(1)}%</strong> of total sales of <strong>{formatMoney(totalActual)}</strong>.</>
+        ? <><strong>{leader.category}</strong> contributed <strong>{formatMoney(leader.current.actual)}</strong>, accounting for <strong>{Math.round(leaderPercentage)}%</strong> of total sales of <strong>{formatMoney(totalActual)}</strong>.</>
         : 'No category sales were recorded for the selected period and channel.'}</p>
     </div>
   </section>
@@ -554,13 +756,13 @@ function CustomersByEmail({
   return <section className={`dashboard-detail-card ${loading ? 'is-loading' : ''}`}>
     <div className="detail-card-head"><span className="detail-card-icon">＠</span><div><span className="section-kicker">Customer frequency</span><h3>Customers by Email</h3></div></div>
     {data.total_customers ? <div className="customer-mix">
-      <div className="customer-mix-bar" aria-label={`${data.unique_percent}% unique customers and ${data.repeat_percent}% repeat customers`}>
+      <div className="customer-mix-bar" aria-label={`${Math.round(data.unique_percent)}% unique customers and ${Math.round(data.repeat_percent)}% repeat customers`}>
         <span className="unique" style={{ width: `${data.unique_percent}%` }} />
         <span className="repeat" style={{ width: `${data.repeat_percent}%` }} />
       </div>
       <div className="customer-mix-values">
-        <div><span><i className="unique" />Unique Customers</span><strong>{data.unique_percent.toFixed(1)}%</strong><small>{data.unique_customers.toLocaleString('en-IN')} customers</small></div>
-        <div><span><i className="repeat" />Repeat Customers</span><strong>{data.repeat_percent.toFixed(1)}%</strong><small>{data.repeat_customers.toLocaleString('en-IN')} customers</small></div>
+        <div><span><i className="unique" />Unique Customers</span><strong>{Math.round(data.unique_percent)}%</strong><small>{data.unique_customers.toLocaleString('en-IN')} customers</small></div>
+        <div><span><i className="repeat" />Repeat Customers</span><strong>{Math.round(data.repeat_percent)}%</strong><small>{data.repeat_customers.toLocaleString('en-IN')} customers</small></div>
       </div>
       <p>Total identified customers: <strong>{data.total_customers.toLocaleString('en-IN')}</strong></p>
     </div> : <div className="detail-empty detail-empty-large">No Data Available</div>}
@@ -570,7 +772,7 @@ function CustomersByEmail({
 function StateWisePerformance({ rows, loading }: { rows: DashboardData['state_performance']; loading: boolean }) {
   const visible = rows.slice(0, 10)
   const maximum = Math.max(...visible.map((row) => row.amount), 1)
-  const total = rows.reduce((sum, row) => sum + row.amount, 0)
+  const total = rows.reduce((sum, row) => sum + Math.round(row.amount), 0)
   return <section className={`dashboard-detail-card state-performance ${loading ? 'is-loading' : ''}`}>
     <div className="detail-card-head"><span className="detail-card-icon">⌖</span><div><span className="section-kicker">Geographic sales</span><h3>State Wise Performance</h3></div></div>
     {visible.length ? <>
@@ -590,17 +792,25 @@ function DashboardPage() {
   const initialMonth = String(today.getMonth() + 1)
   const initialYear = today.getFullYear()
   const previousDate = new Date(initialYear, today.getMonth() - 1, 1)
+  const defaults: DashboardFilters = {
+    channel: 'all',
+    time: { grain: 'monthly', period: initialMonth },
+    year: initialYear,
+    comparison: { grain: 'monthly', period: String(previousDate.getMonth() + 1) },
+    comparisonYear: previousDate.getFullYear(),
+  }
+  const [initialFilters] = useState(() => savedDashboardFilters(defaults))
   const [data, setData] = useState<DashboardData | null>(null)
-  const [selected, setSelected] = useState('all')
-  const [time, setTime] = useState<TimeSelection>({ grain: 'monthly', period: initialMonth })
-  const [activeYear, setActiveYear] = useState(initialYear)
-  const [comparison, setComparison] = useState<TimeSelection>({ grain: 'monthly', period: String(previousDate.getMonth() + 1) })
-  const [comparisonYear, setComparisonYear] = useState(previousDate.getFullYear())
-  const [draftChannel, setDraftChannel] = useState('all')
-  const [draftTime, setDraftTime] = useState<TimeSelection>({ grain: 'monthly', period: initialMonth })
-  const [draftYear, setDraftYear] = useState(initialYear)
-  const [draftComparison, setDraftComparison] = useState<TimeSelection>({ grain: 'monthly', period: String(previousDate.getMonth() + 1) })
-  const [draftComparisonYear, setDraftComparisonYear] = useState(previousDate.getFullYear())
+  const [selected, setSelected] = useState(initialFilters.channel)
+  const [time, setTime] = useState<TimeSelection>(initialFilters.time)
+  const [activeYear, setActiveYear] = useState(initialFilters.year)
+  const [comparison, setComparison] = useState<TimeSelection>(initialFilters.comparison)
+  const [comparisonYear, setComparisonYear] = useState(initialFilters.comparisonYear)
+  const [draftChannel, setDraftChannel] = useState(initialFilters.channel)
+  const [draftTime, setDraftTime] = useState<TimeSelection>(initialFilters.time)
+  const [draftYear, setDraftYear] = useState(initialFilters.year)
+  const [draftComparison, setDraftComparison] = useState<TimeSelection>(initialFilters.comparison)
+  const [draftComparisonYear, setDraftComparisonYear] = useState(initialFilters.comparisonYear)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(new Set(['zero_rated', 'exempted', 'taxable', 'pnl']))
@@ -639,12 +849,27 @@ function DashboardPage() {
   }, [selected, time, activeYear, comparison, comparisonYear])
 
   const applyFilters = () => {
+    const appliedTime = draftTime.grain === 'yearly' ? { ...draftTime, period: String(draftYear) } : draftTime
+    const appliedComparison = draftComparison.grain === 'yearly' ? { ...draftComparison, period: String(draftComparisonYear) } : draftComparison
     setLoading(true)
     setSelected(draftChannel)
-    setTime(draftTime.grain === 'yearly' ? { ...draftTime, period: String(draftYear) } : draftTime)
+    setTime(appliedTime)
     setActiveYear(draftYear)
-    setComparison(draftComparison.grain === 'yearly' ? { ...draftComparison, period: String(draftComparisonYear) } : draftComparison)
+    setComparison(appliedComparison)
     setComparisonYear(draftComparisonYear)
+    localStorage.setItem(DASHBOARD_FILTERS_KEY, JSON.stringify({
+      channel: draftChannel, time: appliedTime, year: draftYear,
+      comparison: appliedComparison, comparisonYear: draftComparisonYear,
+    }))
+  }
+
+  const resetFilters = () => {
+    localStorage.removeItem(DASHBOARD_FILTERS_KEY)
+    setLoading(true)
+    setSelected(defaults.channel); setTime(defaults.time); setActiveYear(defaults.year)
+    setComparison(defaults.comparison); setComparisonYear(defaults.comparisonYear)
+    setDraftChannel(defaults.channel); setDraftTime(defaults.time); setDraftYear(defaults.year)
+    setDraftComparison(defaults.comparison); setDraftComparisonYear(defaults.comparisonYear)
   }
 
   const selectGrain = (grain: TimeSelection['grain']) => {
@@ -674,15 +899,49 @@ function DashboardPage() {
   const comparisonPlanMonths = planMonthsForGrain(comparison.grain, comparison.period)
   const channelActual = (period: 'current' | 'comparison', channel: string) =>
     data?.channel_wise_performance[period][channel] ?? 0
+  const authoritativeCurrentTotal = Math.round(channelActual('current', 'Total Sales'))
+  const authoritativeComparisonTotal = Math.round(channelActual('comparison', 'Total Sales'))
+  const categoryCurrentActuals = reconciledWholeValues(
+    data?.category_performance.map((row) => row.current.actual) ?? [],
+    authoritativeCurrentTotal,
+  )
+  const categoryComparisonActuals = reconciledWholeValues(
+    data?.category_performance.map((row) => row.comparison.actual) ?? [],
+    authoritativeComparisonTotal,
+  )
+  const categoryPerformance = data?.category_performance.map((row, index) => ({
+    ...row,
+    current: { ...row.current, actual: categoryCurrentActuals[index] },
+    comparison: { ...row.comparison, actual: categoryComparisonActuals[index] },
+  })) ?? []
+  const coreChannels = [
+    { channel: 'Digital Online', monthlyPlan: CHANNEL_MONTHLY_PLANS.digitalOnline },
+    { channel: 'Stall Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.stallSales },
+    { channel: 'Direct Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.directSales },
+    { channel: 'Bulk Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.bulkSales },
+  ]
+  const reconciledChannelActuals = (period: 'current' | 'comparison', total: number) => {
+    const directNames = ['Stall Sales', 'Direct Sales', 'Bulk Sales']
+    const directRaw = directNames.map((channel) => channelActual(period, channel))
+    let directActuals = reconciledWholeValues(
+      directRaw,
+      Math.round(directRaw.reduce((sum, value) => sum + value, 0)),
+    )
+    const digitalRaw = channelActual(period, 'Digital Online')
+    let digitalActual = Math.round(digitalRaw)
+    const difference = total - digitalActual - directActuals.reduce((sum, value) => sum + value, 0)
+    if (difference && digitalRaw !== 0) digitalActual += difference
+    else if (difference) directActuals = reconciledWholeValues(directRaw, directActuals.reduce((sum, value) => sum + value, 0) + difference)
+    return [digitalActual, ...directActuals]
+  }
+  const currentChannelActuals = reconciledChannelActuals('current', authoritativeCurrentTotal)
+  const comparisonChannelActuals = reconciledChannelActuals('comparison', authoritativeComparisonTotal)
   const channelPerformance = [
-    { channel: 'Digital Online', monthlyPlan: CHANNEL_MONTHLY_PLANS.digitalOnline, currentActual: channelActual('current', 'Digital Online'), comparisonActual: channelActual('comparison', 'Digital Online') },
-    { channel: 'Stall Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.stallSales, currentActual: channelActual('current', 'Stall Sales'), comparisonActual: channelActual('comparison', 'Stall Sales') },
-    { channel: 'Direct Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.directSales, currentActual: channelActual('current', 'Direct Sales'), comparisonActual: channelActual('comparison', 'Direct Sales') },
-    { channel: 'Bulk Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.bulkSales, currentActual: channelActual('current', 'Bulk Sales'), comparisonActual: channelActual('comparison', 'Bulk Sales') },
-    { channel: 'Total Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.totalSales, currentActual: channelActual('current', 'Total Sales'), comparisonActual: channelActual('comparison', 'Total Sales') },
+    ...coreChannels.map((row, index) => ({ ...row, currentActual: currentChannelActuals[index], comparisonActual: comparisonChannelActuals[index] })),
+    { channel: 'Total Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.totalSales, currentActual: authoritativeCurrentTotal, comparisonActual: authoritativeComparisonTotal },
     { channel: 'Language Lab', monthlyPlan: CHANNEL_MONTHLY_PLANS.languageLab, currentActual: channelActual('current', 'Language Lab'), comparisonActual: channelActual('comparison', 'Language Lab') },
     { channel: 'OTT', monthlyPlan: CHANNEL_MONTHLY_PLANS.ott, currentActual: channelActual('current', 'OTT'), comparisonActual: channelActual('comparison', 'OTT') },
-    { channel: 'Grand Total Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.grandTotal, currentActual: channelActual('current', 'Grand Total Sales'), comparisonActual: channelActual('comparison', 'Grand Total Sales') },
+    { channel: 'Grand Total Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.grandTotal, currentActual: Math.round(channelActual('current', 'Grand Total Sales')), comparisonActual: Math.round(channelActual('comparison', 'Grand Total Sales')) },
   ]
   const performanceHeaders = [
     'Name',
@@ -691,15 +950,15 @@ function DashboardPage() {
   ]
   const downloadCategoryPerformance = () => {
     if (!data) return
-    const rows = [...data.category_performance, {
+    const rows = [...categoryPerformance, {
       category: 'Total',
       current: {
-        plan: data.category_performance.reduce((sum, row) => sum + row.current.plan, 0),
-        actual: data.category_performance.reduce((sum, row) => sum + row.current.actual, 0),
+        plan: categoryPerformance.reduce((sum, row) => sum + Math.round(row.current.plan), 0),
+        actual: authoritativeCurrentTotal,
       },
       comparison: {
-        plan: data.category_performance.reduce((sum, row) => sum + row.comparison.plan, 0),
-        actual: data.category_performance.reduce((sum, row) => sum + row.comparison.actual, 0),
+        plan: categoryPerformance.reduce((sum, row) => sum + Math.round(row.comparison.plan), 0),
+        actual: authoritativeComparisonTotal,
       },
     }]
     downloadCsv(
@@ -707,8 +966,8 @@ function DashboardPage() {
       performanceHeaders,
       rows.map((row) => [
         row.category,
-        row.current.plan, row.current.actual, variance(row.current.actual, row.current.plan), variancePercent(row.current.actual, row.current.plan).toFixed(1),
-        row.comparison.plan, row.comparison.actual, variance(row.comparison.actual, row.comparison.plan), variancePercent(row.comparison.actual, row.comparison.plan).toFixed(1),
+        number(row.current.plan), number(row.current.actual), number(variance(row.current.actual, row.current.plan)), reportPercentage(variancePercent(row.current.actual, row.current.plan)),
+        number(row.comparison.plan), number(row.comparison.actual), number(variance(row.comparison.actual, row.comparison.plan)), reportPercentage(variancePercent(row.comparison.actual, row.comparison.plan)),
       ]),
     )
   }
@@ -720,8 +979,8 @@ function DashboardPage() {
       const comparisonPlan = row.monthlyPlan * comparisonPlanMonths
       return [
         row.channel,
-        currentPlan, row.currentActual, variance(row.currentActual, currentPlan), variancePercent(row.currentActual, currentPlan).toFixed(1),
-        comparisonPlan, row.comparisonActual, variance(row.comparisonActual, comparisonPlan), variancePercent(row.comparisonActual, comparisonPlan).toFixed(1),
+        number(currentPlan), number(row.currentActual), number(variance(row.currentActual, currentPlan)), reportPercentage(variancePercent(row.currentActual, currentPlan)),
+        number(comparisonPlan), number(row.comparisonActual), number(variance(row.comparisonActual, comparisonPlan)), reportPercentage(variancePercent(row.comparisonActual, comparisonPlan)),
       ]
     }),
   )
@@ -733,7 +992,7 @@ function DashboardPage() {
       {error && <div className="error-message dashboard-error"><Icon name="info" size={18} /><span>{error}</span></div>}
       {data && <>
         <div className="comparison-panel">
-          <div className="comparison-panel-head"><div><span className="filter-label">Dashboard comparison</span><h3>Compare sales periods</h3></div><button className="apply-filter-button" onClick={applyFilters}>Apply</button></div>
+          <div className="comparison-panel-head"><div><span className="filter-label">Dashboard comparison</span><h3>Compare sales periods</h3></div><div className="filter-actions"><button className="reset-filter-button" onClick={resetFilters}>Reset</button><button className="apply-filter-button" onClick={applyFilters}>Apply</button></div></div>
           <div className="comparison-selectors">
             {[
               { title: 'Primary period', value: draftTime, year: draftYear, setValue: setDraftTime, setYear: setDraftYear },
@@ -906,15 +1165,15 @@ function DashboardPage() {
                 <tr><th>Plan</th><th>Actual</th><th>Var.</th><th>Var.%</th><th>Plan</th><th>Actual</th><th>Var.</th><th>Var.%</th></tr>
               </thead>
               <tbody>
-                {[...data.category_performance, {
+                {[...categoryPerformance, {
                   category: 'Total',
                   current: {
-                    plan: data.category_performance.reduce((sum, row) => sum + row.current.plan, 0),
-                    actual: data.category_performance.reduce((sum, row) => sum + row.current.actual, 0),
+                    plan: categoryPerformance.reduce((sum, row) => sum + Math.round(row.current.plan), 0),
+                    actual: authoritativeCurrentTotal,
                   },
                   comparison: {
-                    plan: data.category_performance.reduce((sum, row) => sum + row.comparison.plan, 0),
-                    actual: data.category_performance.reduce((sum, row) => sum + row.comparison.actual, 0),
+                    plan: categoryPerformance.reduce((sum, row) => sum + Math.round(row.comparison.plan), 0),
+                    actual: authoritativeComparisonTotal,
                   },
                 }].map((row) => {
                   const currentVariance = variance(row.current.actual, row.current.plan)
@@ -923,10 +1182,10 @@ function DashboardPage() {
                     <th>{row.category}</th>
                     <td>{number(row.current.plan)}</td><td>{number(row.current.actual)}</td>
                     <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{currentVariance >= 0 ? '+' : ''}{number(currentVariance)}</td>
-                    <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{variancePercent(row.current.actual, row.current.plan).toFixed(1)}%</td>
+                    <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{Math.round(variancePercent(row.current.actual, row.current.plan))}%</td>
                     <td>{number(row.comparison.plan)}</td><td>{number(row.comparison.actual)}</td>
                     <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{comparisonVariance >= 0 ? '+' : ''}{number(comparisonVariance)}</td>
-                    <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{variancePercent(row.comparison.actual, row.comparison.plan).toFixed(1)}%</td>
+                    <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{Math.round(variancePercent(row.comparison.actual, row.comparison.plan))}%</td>
                   </tr>
                 })}
               </tbody>
@@ -955,17 +1214,17 @@ function DashboardPage() {
                     <th>{row.channel}</th>
                     <td>{number(currentPlan)}</td><td>{number(row.currentActual)}</td>
                     <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{currentVariance >= 0 ? '+' : ''}{number(currentVariance)}</td>
-                    <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{variancePercent(row.currentActual, currentPlan).toFixed(1)}%</td>
+                    <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{Math.round(variancePercent(row.currentActual, currentPlan))}%</td>
                     <td>{number(comparisonPlan)}</td><td>{number(row.comparisonActual)}</td>
                     <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{comparisonVariance >= 0 ? '+' : ''}{number(comparisonVariance)}</td>
-                    <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{variancePercent(row.comparisonActual, comparisonPlan).toFixed(1)}%</td>
+                    <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{Math.round(variancePercent(row.comparisonActual, comparisonPlan))}%</td>
                   </tr>
                 })}
               </tbody>
             </table>
           </div>
         </section>
-        <CategoryWiseSales rows={data.category_performance} loading={loading} />
+        <CategoryWiseSales rows={categoryPerformance} loading={loading} />
         {selected !== 'all' && <ProductRankings data={data.product_performance} loading={loading} />}
         <TopProductByChannel channels={data.product_performance.channels} loading={loading} />
         <StateWisePerformance rows={data.state_performance} loading={loading} />
@@ -1102,7 +1361,7 @@ function CategoryReview({
                         <td>{row.order_number ?? '—'}</td><td className="product-cell">{row.product_name ?? '—'}</td>
                         <td><span className="category-tag">{row.original_category}</span></td><td>₹{amount(row.amount)}</td>
                         <td><select value={choices[row.row_id] ?? ''} onChange={(event) => setChoices({ ...choices, [row.row_id]: event.target.value })}>
-                          <option value="">Select category</option><option>Books</option><option>Web Version</option><option>Audio Device</option><option>Pen Drive</option>
+                          <option value="">Select category</option><option>Books</option><option>Web Version</option><option>Audio Device</option><option>Pen Drive</option>{channel === 'Direct Sales' && <option>N/A</option>}
                         </select></td>
                         <td><button className="table-action" disabled={busyRow === row.row_id} onClick={() => updateCategory(row)}>{busyRow === row.row_id ? 'Updating…' : 'Update'}</button></td>
                       </tr>
@@ -1347,7 +1606,7 @@ function UploadHistoryPage() {
           <div className="table-wrap"><table><thead><tr><th>Dataset ID</th><th>File name</th><th>Channel</th><th>Uploaded</th><th>Uploaded by</th><th>Records</th><th>Status</th><th /></tr></thead><tbody>
             {records.map((record) => <tr key={record.upload_id}>
               <td><span className="dataset-id" title={record.upload_id}>{record.upload_id.slice(0, 8)}…</span></td><td className="history-file">{record.file_name}</td><td><span className={`channel-badge ${record.channel.toLowerCase()}`}>{record.channel}</span></td>
-              <td>{new Date(record.uploaded_at).toLocaleString()}</td><td>{record.uploaded_by}</td><td>{record.total_records.toLocaleString()}</td><td><span className="status-complete">{record.upload_status}</span></td>
+              <td>{new Date(record.uploaded_at).toLocaleString('en-IN')}</td><td>{record.uploaded_by}</td><td>{record.total_records.toLocaleString('en-IN')}</td><td><span className="status-complete">{record.upload_status}</span></td>
               <td><button className="delete-button" disabled={deleting === record.upload_id} onClick={() => remove(record)}>{deleting === record.upload_id ? 'Deleting…' : 'Delete'}</button></td>
             </tr>)}
           </tbody></table></div>
@@ -1508,7 +1767,7 @@ function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">M</div>
-          <div><strong>Meru MIS</strong><span>Sales intelligence</span></div>
+          <div><strong>MIS Sales</strong><span>Dashboard</span></div>
         </div>
         <nav aria-label="Main navigation">
           <p className="nav-label">Workspace</p>
@@ -1520,11 +1779,6 @@ function App() {
             </button>
           ))}
         </nav>
-        <div className="sidebar-footer">
-          <div className="user-avatar">AK</div>
-          <div className="user-copy"><strong>Admin User</strong><span>admin@meru.com</span></div>
-          <button className="icon-button" aria-label="Log out"><Icon name="logout" size={18} /></button>
-        </div>
       </aside>
 
       <main>

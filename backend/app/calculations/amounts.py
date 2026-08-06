@@ -1,3 +1,4 @@
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 
@@ -8,6 +9,14 @@ def normalise_header(value: object) -> str:
 def find_column(columns: list[object], aliases: tuple[str, ...]) -> str | None:
     available = {normalise_header(column): str(column) for column in columns}
     return next((available[alias] for alias in aliases if alias in available), None)
+
+
+def whole_number(value: object) -> int:
+    """Round displayed values half-up, matching positive JavaScript Math.round."""
+    try:
+        return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    except (ValueError, TypeError):
+        return 0
 
 
 def dsg_amount_column(columns: list[object]) -> str | None:

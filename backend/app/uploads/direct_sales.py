@@ -2,10 +2,12 @@ from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
 import re
+from typing import Literal
 from uuid import uuid4
 
 import pandas as pd
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.database.database import SessionLocal
@@ -15,7 +17,6 @@ from app.uploads.dsg import (
     CATEGORY_MAPPING,
     MAX_FILE_SIZE,
     ProductUpdate,
-    CategoryUpdate,
     STANDARD_CATEGORIES,
     _json_value,
     _normalise_header,
@@ -25,6 +26,11 @@ from app.uploads.dsg import (
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
 DIRECT_SALES_UPLOAD_STORE: dict[str, dict[str, object]] = {}
+DIRECT_SALES_CATEGORIES = (*STANDARD_CATEGORIES, "N/A")
+
+
+class DirectSalesCategoryUpdate(BaseModel):
+    category: Literal["Books", "Web Version", "Audio Device", "Pen Drive", "N/A"]
 
 AMOUNT_ALIASES = (
     "without tax total",
@@ -60,7 +66,10 @@ def _invoice_key(value: object) -> str:
 
 
 def _sales_classification(private_notes: object, quantity: object) -> str:
-    if "stall" in str(private_notes).casefold():
+    notes = str(private_notes).casefold()
+    if "language lab" in notes:
+        return "Language Lab"
+    if "stall" in notes:
         return "Stall Sales"
     try:
         if float(quantity) > 10:
@@ -134,7 +143,7 @@ def _category_rows(upload: dict[str, object]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for index, row in frame.iterrows():
         category = str(row[columns["category"]]).strip()
-        if category in STANDARD_CATEGORIES:
+        if category in DIRECT_SALES_CATEGORIES:
             continue
         rows.append(
             {
@@ -372,12 +381,12 @@ def get_category_review(upload_id: str) -> dict[str, object]:
         "records": rows,
         "remaining": len(rows),
         "completed": not rows,
-        "standard_categories": STANDARD_CATEGORIES,
+        "standard_categories": DIRECT_SALES_CATEGORIES,
     }
 
 
 @router.patch("/direct-sales/{upload_id}/category-review/{row_id}")
-def update_category(upload_id: str, row_id: int, update: CategoryUpdate) -> dict[str, object]:
+def update_category(upload_id: str, row_id: int, update: DirectSalesCategoryUpdate) -> dict[str, object]:
     upload = _get_upload(upload_id)
     frame = upload["frame"]
     columns = upload["resolved_columns"]
