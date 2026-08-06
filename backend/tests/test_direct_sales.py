@@ -84,6 +84,7 @@ class DirectSalesUploadTests(unittest.TestCase):
         self.assertIn("Sales Inventory Dataset", str(raised.exception.detail))
 
     def test_sales_classification_is_mutually_exclusive_with_stall_precedence(self):
+        self.assertEqual(direct_sales._sales_classification("Language Lab order", 25), "Language Lab")
         self.assertEqual(direct_sales._sales_classification("Annual STALL event", 25), "Stall Sales")
         self.assertEqual(direct_sales._sales_classification("", 11), "Bulk Sales")
         self.assertEqual(direct_sales._sales_classification("", 10), "Direct Sales")

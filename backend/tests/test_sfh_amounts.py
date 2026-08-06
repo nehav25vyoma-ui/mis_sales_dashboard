@@ -2,6 +2,7 @@ from app.calculations.amounts import (
     sfh_amount_from_record,
     sfh_amount_from_values,
     sfh_is_inr_currency,
+    whole_number,
 )
 
 
@@ -31,3 +32,8 @@ def test_sfh_record_lookup_uses_normalised_headers() -> None:
         "Earnings": 900,
     }
     assert sfh_amount_from_record(record) == 900
+
+
+def test_whole_number_matches_visual_half_up_rounding() -> None:
+    assert whole_number(100.49) == 100
+    assert whole_number(100.5) == 101
