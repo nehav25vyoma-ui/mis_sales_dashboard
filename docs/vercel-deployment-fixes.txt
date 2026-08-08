@@ -1,0 +1,167 @@
+MIS SALES DASHBOARD - VERCEL DEPLOYMENT FIXES
+==============================================
+
+1. FRONTEND API RETURNED HTML INSTEAD OF JSON
+Error:
+  Unexpected token ... is not valid JSON
+
+Cause:
+  Vercel returned an HTML error page because /api/* was not connected to
+  the FastAPI backend.
+
+Fix:
+  Added Vercel API routing and a FastAPI serverless entry point.
+
+
+2. VERCEL WAS CONNECTED TO THE WRONG GITHUB REPOSITORY
+Cause:
+  Vercel was connected to mis_sales instead of mis_sales_dashboard.
+
+Fix:
+  Connected Vercel to the correct repository and selected the main branch.
+
+
+3. VERCEL REDEPLOYED THE OLD INITIAL COMMIT
+Cause:
+  The Redeploy operation reused the old deployment source.
+
+Fix:
+  Created a deployment from the latest main branch commit.
+
+
+4. FRONTEND DEPENDENCIES WERE NOT INSTALLED
+Cause:
+  The React project is located inside frontend/, while Vercel builds from
+  the repository root.
+
+Fix:
+  Added this explicit Vercel installation command:
+  npm install --prefix frontend
+
+
+5. PYTHON REQUIREMENTS COULD NOT BE PARSED
+Error:
+  could not parse requirements.txt
+  Error parsing included file
+
+Cause:
+  The root requirements.txt referenced backend/requirements.txt using -r,
+  which the Vercel requirements parser rejected.
+
+Fix:
+  Listed all Python packages directly in the root requirements.txt file.
+
+
+6. LOCAL POSTGRESQL WAS INACCESSIBLE FROM VERCEL
+Cause:
+  The local database host was ::1, which is equivalent to localhost.
+  A cloud deployment cannot access a database running only on a local PC.
+
+Fix:
+  Created a hosted PostgreSQL database on Neon.
+
+
+7. DATABASE AUTHENTICATION FAILED
+Error:
+  password authentication failed for user 'neondb_owner'
+
+Cause:
+  pgAdmin used an old or incorrect Neon password.
+
+Fix:
+  Reset the Neon role password and updated the connection credentials.
+
+
+8. DATABASE PASSWORD WAS EXPOSED
+Cause:
+  A complete database connection string containing the password was shared.
+
+Fix:
+  Rotated the Neon password and replaced the old credentials in Vercel and
+  pgAdmin.
+
+
+9. LOCAL DATABASE DATA WAS MISSING FROM NEON
+Cause:
+  Creating a hosted database does not automatically copy local tables or data.
+
+Fix:
+  Backed up the local MIS_SALES database and restored it into Neon.
+
+Migrated tables:
+  direct_sales_dataset_rows
+  dsg_dataset_rows
+  sfh_dataset_rows
+  upload_history
+
+
+10. VERCEL FUNCTION DID NOT EXPLICITLY INCLUDE THE BACKEND
+Cause:
+  The API dynamically imported modules from backend/, which needed to be
+  included in the Vercel serverless bundle.
+
+Fix:
+  Configured the function to include backend/**.
+
+
+11. DATABASE CONNECTION RAN DURING APPLICATION STARTUP
+Cause:
+  Base.metadata.create_all() ran during every FastAPI startup. A database
+  problem could therefore crash every API endpoint.
+
+Fix:
+  Removed automatic startup table creation because the database schema had
+  already been migrated.
+
+
+12. DIAGNOSTIC CODE WAS NOT RECOGNIZED AS A VERCEL FUNCTION
+Error:
+  The pattern "api/index.py" doesn't match any Serverless Functions.
+
+Cause:
+  The ASGI app object was created inside a try block, so Vercel's static
+  detector could not identify it.
+
+Fix:
+  Defined the FastAPI app at module level.
+
+
+13. BACKEND UPLOAD MODULES WERE MISSING FROM GIT
+Error:
+  ModuleNotFoundError: No module named 'app.uploads'
+
+Cause:
+  The .gitignore rule uploads/ unintentionally ignored backend/app/uploads/.
+
+Fix:
+  Changed the rule to /uploads/ and committed the backend upload modules.
+
+
+14. FRONTEND ERROR REPORTING WAS MISLEADING
+Cause:
+  The frontend attempted to parse every response as JSON, including HTML
+  error pages returned by Vercel.
+
+Fix:
+  Added response Content-Type validation and a clearer API error message.
+
+
+15. DEPLOYMENT HEALTH COULD NOT BE CHECKED SEPARATELY
+Fix:
+  Added these endpoints:
+  /api/health
+  /api/db-test
+
+
+FINAL VERIFICATION
+==================
+
+API health response:
+  {"status":"ok"}
+
+Database test response:
+  {"message":"Database Connected Successfully"}
+
+Result:
+  The React frontend, FastAPI serverless backend, and hosted Neon PostgreSQL
+  database are deployed and connected successfully.
