@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import './App.css'
 
 type ModuleId = 'dashboard' | 'upload' | 'reports' | 'history'
 type UploadState = 'idle' | 'selected' | 'uploading' | 'error'
 type WorkflowPage = 'upload' | 'category' | 'product' | 'saving'
-type UploadChannel = 'DSG' | 'SFH' | 'Direct Sales'
+type UploadChannel = 'DSG' | 'SFH' | 'Amazon' | 'Direct Sales'
 
 type ReviewRow = {
   row_id: number
@@ -50,6 +50,7 @@ type DashboardData = {
   selected_channel: string
   selected_grain: string
   selected_period: string
+  selected_year: number
   available_years: number[]
   category_performance: {
     category: string
@@ -64,6 +65,11 @@ type DashboardData = {
       top: { name: string; amount: number }[]
       bottom: { name: string; amount: number }[]
     }[]
+    details: {
+      year: number; month: number; channel: string; category: string; orders: number; quantity: number
+      description: string; basic_value: number; shipping: number; discount: number
+      taxable_value: number; tax: number; total_invoice_value: number
+    }[]
   }
   customer_performance: {
     total_customers: number
@@ -72,7 +78,12 @@ type DashboardData = {
     unique_percent: number
     repeat_percent: number
   }
-  state_performance: { state: string; amount: number }[]
+  state_performance: { state: string; amount: number; orders: number; customers: number }[]
+  state_order_details: {
+    year: number; month: number; channel: string; order_id: string; category: string
+    description: string; quantity: number; sales: number; state: string; email?: string
+    classification: 'india' | 'international' | 'invalid'
+  }[]
   direct_sales_performance: {
     current: Record<string, number>
     comparison: Record<string, number>
@@ -82,8 +93,12 @@ type DashboardData = {
     comparison: Record<string, number>
   }
   sales_trend: {
-    mode: 'channel' | 'month'
-    points: { label: string; value: number }[]
+    monthly_points: {
+      key: string
+      label: string
+      value: number
+      breakdown: Record<string, number>
+    }[]
   }
   filters: { id: string; label: string }[]
   cards: KpiCardData[]
@@ -103,6 +118,12 @@ type DashboardFilters = {
 }
 
 const DASHBOARD_FILTERS_KEY = 'mis-sales-dashboard-filters'
+const DASHBOARD_CACHE_TTL_MS = 5 * 60 * 1000
+const dashboardResponseCache = new Map<string, { data: DashboardData; storedAt: number }>()
+
+function clearDashboardCache() {
+  dashboardResponseCache.clear()
+}
 
 function savedDashboardFilters(fallback: DashboardFilters): DashboardFilters {
   try {
@@ -119,6 +140,19 @@ function savedDashboardFilters(fallback: DashboardFilters): DashboardFilters {
   return fallback
 }
 
+function shouldUseLatestDashboardPeriod(currentYear: number, currentMonth: string) {
+  const stored = localStorage.getItem(DASHBOARD_FILTERS_KEY)
+  if (stored === null) return true
+  try {
+    const saved = JSON.parse(stored) as Partial<DashboardFilters>
+    return saved.time?.grain === 'monthly'
+      && saved.time.period === currentMonth
+      && saved.year === currentYear
+  } catch {
+    return true
+  }
+}
+
 const months = [
   'January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December',
@@ -130,8 +164,7 @@ const quarters = [
   'Q4 (Oct, Nov, Dec)',
 ]
 
-// Covers the full Digital Online group (DSG + SFH + Amazon). Amazon actuals
-// are not integrated yet, so achievement will understate real performance.
+// Covers the full Digital Online group (DSG + SFH + Amazon).
 const TOTAL_SALES_MONTHLY_PLAN = 500000
 const CHANNEL_MONTHLY_PLANS = {
   digitalOnline: 300000,
@@ -142,6 +175,12 @@ const CHANNEL_MONTHLY_PLANS = {
   languageLab: 125000,
   ott: 200000,
   grandTotal: 825000,
+}
+const SALES_TREND_MONTHLY_PLANS: Record<string, number> = {
+  DSG: 100000,
+  SFH: 100000,
+  Amazon: 100000,
+  'Direct Sales': 200000,
 }
 
 function getPlanForGrain(monthlyPlan: number, grain: TimeSelection['grain'], period = '') {
@@ -171,11 +210,16 @@ const modules: { id: ModuleId; label: string; icon: string }[] = [
 const channels = [
   { name: 'DSG', status: 'Available', tone: 'indigo' },
   { name: 'SFH', status: 'Available', tone: 'violet' },
-  { name: 'Amazon', status: 'Coming soon', tone: 'orange' },
+  { name: 'Amazon', status: 'Available', tone: 'orange' },
   { name: 'Direct Sales', status: 'Available', tone: 'teal' },
 ]
 
 const channelPath = (channel: UploadChannel) => channel === 'Direct Sales' ? 'direct-sales' : channel.toLowerCase()
+const channelDisplayName = (channel: string) => channel === 'DSG'
+  ? 'DSG'
+  : channel === 'SFH'
+    ? 'SFH'
+    : channel
 
 function downloadCsv(filename: string, headers: string[], rows: (string | number)[][]) {
   const escape = (value: string | number) => {
@@ -219,6 +263,7 @@ function Icon({ name, size = 20 }: { name: string; size?: number }) {
     cloud: <><path d="M7 18h10a4 4 0 0 0 .4-8A6 6 0 0 0 6 8.5 4.8 4.8 0 0 0 7 18Z" /><path d="m9 13 3-3 3 3m-3-3v7" /></>,
     x: <><path d="m7 7 10 10M17 7 7 17" /></>,
     info: <><circle cx="12" cy="12" r="9" /><path d="M12 11v5m0-8h.01" /></>,
+    calendar: <><rect x="3" y="5" width="18" height="16" rx="2" /><path d="M8 3v4m8-4v4M3 10h18" /><path d="M8 14h.01m4 0h.01m4 0h.01M8 18h.01m4 0h.01" /></>,
     logout: <><path d="M10 4H5v16h5m5-4 4-4-4-4m4 4H9" /></>,
   }
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>
@@ -434,43 +479,114 @@ function Sparkline({ values, direction }: { values: number[]; direction: TrendDi
   </svg>
 }
 
-function SalesTrendChart({ trend, loading }: { trend: DashboardData['sales_trend']; loading: boolean }) {
+type SalesPlanTooltipProps = {
+  period: string
+  planValue: number
+  salesValue: number
+  locale?: string
+}
+
+export function SalesPlanTooltip({ period, planValue, salesValue, locale = 'en-IN' }: SalesPlanTooltipProps) {
+  const formatter = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 })
+  const gap = salesValue - planValue
+  const isOverPlan = gap >= 0
+  const achieved = planValue > 0 ? Math.round((salesValue / planValue) * 100) : 0
+  const progress = planValue > 0 ? Math.min(Math.max((salesValue / planValue) * 100, 0), 100) : 0
+  const tickPosition = Math.min(Math.max(progress, .5), 99.5)
+  const status = isOverPlan ? 'over' : 'under'
+
+  return <div className={`sales-plan-tooltip ${status}`} role="status">
+    <div className="sales-plan-tooltip-head">
+      <strong>{period}</strong>
+      <span className="sales-plan-achievement">{achieved}% achieved</span>
+    </div>
+    <div className="sales-plan-values">
+      <div><span className="sales-plan-label"><i className="plan" />Plan</span><strong>{formatter.format(planValue)}</strong></div>
+      <div><span className="sales-plan-label"><i className="sales" />Sales</span><strong>{formatter.format(salesValue)}</strong></div>
+    </div>
+    <div className="sales-plan-progress" aria-label={`${achieved}% of plan achieved`}>
+      <div className="sales-plan-track"><span style={{ width: `${progress}%` }} /><i style={{ left: `${tickPosition}%` }} /></div>
+      <div className="sales-plan-axis"><span>0</span><span>{formatter.format(planValue)}</span></div>
+    </div>
+    <div className="sales-plan-verdict">
+      <span className="sales-plan-direction" aria-hidden="true">{isOverPlan ? '▲' : '▼'}</span>
+      <span>Sales are <strong>{formatter.format(Math.abs(gap))} {isOverPlan ? 'above plan' : 'below plan'}</strong></span>
+    </div>
+  </div>
+}
+
+function SalesTrendChart({ trend, loading, monthlyPlans }: { trend: DashboardData['sales_trend']; loading: boolean; monthlyPlans: Record<string, number> }) {
+  const [grouping, setGrouping] = useState<'month' | 'quarter' | 'year'>('month')
+  const [trendChannel, setTrendChannel] = useState('all')
+  const [activePoint, setActivePoint] = useState<number | null>(null)
+  const trendChannels = [...new Set(trend.monthly_points.flatMap((point) => Object.keys(point.breakdown)))]
+  const selectedMonthlyPlan = trendChannel === 'all'
+    ? Object.values(monthlyPlans).reduce((sum, plan) => sum + plan, 0)
+    : (monthlyPlans[trendChannel] ?? 0)
+  const grouped = (() => {
+    const values = new Map<string, { label: string; value: number; plan: number; breakdown: Record<string, number> }>()
+    trend.monthly_points.forEach((point) => {
+      const [year, month] = point.key.split('-').map(Number)
+      const quarter = Math.floor((month - 1) / 3) + 1
+      const key = grouping === 'month' ? point.key : grouping === 'quarter' ? `${year}-Q${quarter}` : String(year)
+      const label = grouping === 'month' ? point.label : grouping === 'quarter' ? `Q${quarter} ${year}` : String(year)
+      const aggregate = values.get(key) ?? { label, value: 0, plan: 0, breakdown: {} }
+      aggregate.value += trendChannel === 'all' ? point.value : (point.breakdown[trendChannel] ?? 0)
+      aggregate.plan += selectedMonthlyPlan
+      Object.entries(point.breakdown).forEach(([channel, value]) => {
+        aggregate.breakdown[channel] = (aggregate.breakdown[channel] ?? 0) + value
+      })
+      values.set(key, aggregate)
+    })
+    return [...values.values()].filter((point) => point.value !== 0)
+  })()
   const width = 860
-  const height = 330
-  const padding = { top: 38, right: 34, bottom: 82, left: 82 }
+  const height = 360
+  const padding = { top: 52, right: 34, bottom: 48, left: 72 }
   const chartWidth = width - padding.left - padding.right
   const chartHeight = height - padding.top - padding.bottom
   const pointInset = 34
   const pointWidth = chartWidth - pointInset * 2
-  const maximum = Math.max(...trend.points.map((point) => point.value), 1)
+  const maximum = Math.max(...grouped.map((point) => point.value), 1)
   const magnitude = 10 ** Math.floor(Math.log10(maximum))
   const step = Math.max(magnitude, Math.ceil(maximum / (4 * magnitude)) * magnitude)
   const axisMaximum = Math.ceil(maximum / step) * step
-  const ticks = Array.from({ length: 5 }, (_, index) => (axisMaximum / 4) * index)
-  const points = trend.points.map((point, index) => ({
+  const tickCount = 10
+  const ticks = Array.from({ length: tickCount + 1 }, (_, index) => (axisMaximum / tickCount) * index)
+  const points = grouped.map((point, index) => ({
     ...point,
-    x: padding.left + (trend.points.length === 1
+    x: padding.left + (grouped.length === 1
       ? chartWidth / 2
-      : pointInset + (index / (trend.points.length - 1)) * pointWidth),
+      : pointInset + (index / (grouped.length - 1)) * pointWidth),
     y: padding.top + chartHeight - (point.value / axisMaximum) * chartHeight,
   }))
   const path = points.map((point, index) => `${index ? 'L' : 'M'} ${point.x} ${point.y}`).join(' ')
+  const areaPath = points.length ? `${path} L ${points[points.length - 1].x} ${padding.top + chartHeight} L ${points[0].x} ${padding.top + chartHeight} Z` : ''
   const number = (value: number) => Math.round(value).toLocaleString('en-IN')
+  const active = activePoint === null ? null : points[activePoint]
+  const tooltipWidth = 238
+  const tooltipHeight = 194
+  const tooltipX = active ? Math.min(Math.max(active.x - tooltipWidth / 2, padding.left), width - padding.right - tooltipWidth) : 0
+  const tooltipY = active ? Math.max(active.y - tooltipHeight - 16, 8) : 0
   return <section className={`sales-trend-card ${loading ? 'is-loading' : ''}`}>
-    <div className="sales-trend-head"><div><span className="section-kicker">Sales movement</span><h3>Sales Trend</h3></div><span>{trend.mode === 'channel' ? 'By channel' : 'By month'}</span></div>
-    {points.length ? <div className="sales-trend-scroll"><svg className="sales-trend-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`Sales trend ${trend.mode === 'channel' ? 'by channel' : 'by month'}`}>
+    <div className="sales-trend-head"><div><span className="section-kicker">Sales movement</span><h3>Sales Trend</h3></div><div className="sales-trend-controls"><label className="sales-trend-channel"><span>Channel</span><select value={trendChannel} onChange={(event) => { setTrendChannel(event.target.value); setActivePoint(null) }}><option value="all">All Channels</option>{trendChannels.map((channel) => <option value={channel} key={channel}>{channel}</option>)}</select></label><div className="sales-trend-segments" role="group" aria-label="Group sales trend">{(['month', 'quarter', 'year'] as const).map((mode) => <button type="button" className={grouping === mode ? 'active' : ''} key={mode} onClick={() => { setGrouping(mode); setActivePoint(null) }}>By {mode}</button>)}</div></div></div>
+    {points.length ? <div className="sales-trend-scroll"><svg className="sales-trend-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`Sales trend grouped by ${grouping}: ${grouped.map((point) => `${point.label} ${number(point.value)}`).join(', ')}`} onMouseLeave={() => setActivePoint(null)}>
       {ticks.map((tick) => {
         const y = padding.top + chartHeight - (tick / axisMaximum) * chartHeight
         return <g key={tick}><line className="sales-grid-line" x1={padding.left} x2={width - padding.right} y1={y} y2={y} /><text className="sales-y-label" x={padding.left - 12} y={y + 4}>{number(tick)}</text></g>
       })}
-      <text className="sales-axis-title" transform={`translate(20 ${padding.top + chartHeight / 2}) rotate(-90)`}>Sales</text>
+      <path className="sales-trend-area" d={areaPath} />
       <path className="sales-trend-line" d={path} />
-      {points.map((point) => <g key={point.label}>
-        <circle className="sales-trend-point" cx={point.x} cy={point.y} r="5"><title>{point.label}: {number(point.value)}</title></circle>
-        <text className="sales-value-label" x={point.x} y={Math.max(point.y - 13, 16)} textAnchor="middle">{number(point.value)}</text>
-        <text className="sales-x-label" x={point.x} y={height - padding.bottom + 25} textAnchor="end" transform={`rotate(-55 ${point.x} ${height - padding.bottom + 25})`}>{point.label}</text>
+      {points.map((point, index) => <g className="sales-trend-target" key={point.label} tabIndex={0} role="button" aria-label={`${point.label}. Sales ${number(point.value)}. Plan ${number(point.plan)}`} onMouseEnter={() => setActivePoint(index)} onFocus={() => setActivePoint(index)} onBlur={() => setActivePoint(null)}>
+        <circle className="sales-trend-hit-area" cx={point.x} cy={point.y} r="16" />
+        <circle className={`sales-trend-point ${activePoint === index ? 'is-active' : ''}`} cx={point.x} cy={point.y} r="5" />
+        <text className="sales-value-label" x={point.x} y={Math.max(point.y - 23, 16)} textAnchor="middle">{number(point.value)}</text>
+        {index > 0 && points[index - 1].value !== 0 && <text className={point.value >= points[index - 1].value ? 'sales-change-label positive' : 'sales-change-label negative'} x={point.x} y={Math.max(point.y - 11, 28)} textAnchor="middle">{`${point.value >= points[index - 1].value ? '+' : ''}${Math.round(((point.value - points[index - 1].value) / Math.abs(points[index - 1].value)) * 100)}%`}</text>}
+        <text className="sales-x-label" x={point.x} y={height - padding.bottom + 25} textAnchor="middle">{point.label}</text>
       </g>)}
-      <text className="sales-axis-title" x={padding.left + chartWidth / 2} y={height - 8} textAnchor="middle">{trend.mode === 'channel' ? 'Channel' : 'Period'}</text>
+      {active && <foreignObject className="sales-plan-tooltip-object" x={tooltipX} y={tooltipY} width={tooltipWidth} height={tooltipHeight} pointerEvents="none">
+        <SalesPlanTooltip period={active.label} planValue={active.plan} salesValue={active.value} />
+      </foreignObject>}
     </svg></div> : <div className="detail-empty detail-empty-large">No sales trend data available</div>}
   </section>
 }
@@ -554,9 +670,15 @@ function MonthChecklistDropdown({
 function CategoryWiseSales({
   rows,
   loading,
+  channel,
+  onChannelChange,
+  dateFilter,
 }: {
   rows: DashboardData['category_performance']
   loading: boolean
+  channel: string
+  onChannelChange: (channel: string) => void
+  dateFilter: React.ReactNode
 }) {
   const [activeCategory, setActiveCategory] = useState<string | null>(null)
   const colors = ['#ff7424', '#7966ea', '#20a978', '#ed2757']
@@ -625,24 +747,27 @@ function CategoryWiseSales({
     null,
   )
   const leaderPercentage = leader && totalActual ? (leader.current.actual / totalActual) * 100 : 0
+  const leaderColor = leader ? slices.find((slice) => slice.row.category === leader.category)?.color : undefined
   const activeSlice = slices.find((slice) => slice.row.category === activeCategory) ?? null
 
   return <section className={`category-sales-visual ${loading ? 'is-loading' : ''}`}>
     <div className="category-performance-head">
       <div><span className="section-kicker">Category contribution</span><h3>Category Wise Sales</h3></div>
+      <div className="category-performance-actions"><label><span>Channel</span><select value={channel} onChange={(event) => onChannelChange(event.target.value)}><option value="all">All channels</option><option value="dsg">DSG</option><option value="sfh">SFH</option><option value="amazon">Amazon</option><option value="direct">Direct Sales</option></select></label></div>
     </div>
+    {dateFilter}
     <div className="category-sales-layout">
       <div className="category-sales-table-wrap">
         <table className="category-sales-table">
           <thead><tr><th>Category</th><th>Plan</th><th>Actual</th><th>% Contribution</th></tr></thead>
           <tbody>
-            {rows.map((row) => <tr key={row.category}>
+            {rows.map((row, index) => <tr key={row.category}>
               <th>{row.category}</th>
               <td>{formatMoney(row.current.plan)}</td>
-              <td>{formatMoney(row.current.actual)}</td>
-              <td>{totalActual ? Math.round((row.current.actual / totalActual) * 100) : 0}%</td>
+              <td className="category-sales-actual">{formatMoney(row.current.actual)}</td>
+              <td className="contribution-cell" style={{ borderLeftColor: colors[index], backgroundColor: `${colors[index]}18` }}><strong>{totalActual ? Math.round((row.current.actual / totalActual) * 100) : 0}%</strong></td>
             </tr>)}
-            <tr className="performance-total"><th>Total</th><td>{formatMoney(totalPlan)}</td><td>{formatMoney(totalActual)}</td><td>{totalActual ? '100%' : '0%'}</td></tr>
+            <tr className="performance-total"><th>Total</th><td>{formatMoney(totalPlan)}</td><td className="category-sales-actual">{formatMoney(totalActual)}</td><td>{totalActual ? '100%' : '0%'}</td></tr>
           </tbody>
         </table>
       </div>
@@ -678,10 +803,11 @@ function CategoryWiseSales({
         </svg> : <div className="category-pie-empty">No sales data for this selection</div>}
       </div>
     </div>
+    <div className="category-contribution-legend" aria-label="Category contribution color legend"><strong>% Contribution colors</strong>{slices.map((slice) => <span key={slice.row.category}><i style={{ background: slice.color }} />{slice.row.category}</span>)}</div>
     <div className="category-sales-insight">
-      <span>✦</span>
+      <span style={{ color: leaderColor }}>✦</span>
       <p>{leader && totalActual > 0
-        ? <><strong>{leader.category}</strong> contributed <strong>{formatMoney(leader.current.actual)}</strong>, accounting for <strong>{Math.round(leaderPercentage)}%</strong> of total sales of <strong>{formatMoney(totalActual)}</strong>.</>
+        ? <><strong style={{ color: leaderColor }}>{leader.category}</strong> contributed <strong>{formatMoney(leader.current.actual)}</strong>, accounting for <strong className="insight-contribution" style={{ color: leaderColor, backgroundColor: `${leaderColor}18` }}>{Math.round(leaderPercentage)}%</strong> of total sales of <strong>{formatMoney(totalActual)}</strong>.</>
         : 'No category sales were recorded for the selected period and channel.'}</p>
     </div>
   </section>
@@ -690,37 +816,77 @@ function CategoryWiseSales({
 function ProductRankings({
   data,
   loading,
+  dateFilter,
 }: {
   data: DashboardData['product_performance']
   loading: boolean
+  dateFilter?: React.ReactNode
 }) {
+  const [detailChannel, setDetailChannel] = useState('all')
+  const [detailCategory, setDetailCategory] = useState('all')
   const money = (value: number) => `₹${Math.round(value).toLocaleString('en-IN')}`
-  const list = (items: { name: string; amount: number }[], tone: 'top' | 'bottom') =>
-    items.length ? items.map((item, index) => <div className="product-rank-row" key={`${item.name}-${index}`}>
-      <span className="product-rank-number">{index + 1}</span>
-      <span className="product-rank-name" title={item.name}>{item.name}</span>
-      <strong className={tone}>{money(item.amount)}</strong>
-    </div>) : <div className="product-rank-empty">No product sales for this selection</div>
+  const productParts = (name: string) => { const match = name.match(/^(.*?)(?:\s*[·|]\s*|\s+)([A-Z0-9]{2,}(?:-[A-Z0-9]+)+)$/i); return { title: match?.[1]?.trim() || name, sku: match?.[2] || '' } }
+  const list = (items: { name: string; amount: number }[], tone: 'top' | 'bottom') => {
+    const maximum = Math.max(...items.map((item) => item.amount), 1)
+    return items.length ? <div className={`product-rank-items ${tone}`} role="list" aria-label={`${tone === 'top' ? 'Top 5 highest' : 'Bottom 5 lowest'} product sales`}>{items.map((item, index) => {
+      const parts = productParts(item.name)
+      return <div className="product-rank-row" role="listitem" key={`${item.name}-${index}`}>
+        <span className="product-rank-number">{index + 1}</span>
+        <span className="product-rank-name" title={item.name}><span>{parts.title}</span>{parts.sku && <small>· {parts.sku}</small>}</span>
+        <strong className={tone}>{money(item.amount)}</strong>
+        <span className="product-magnitude-track" aria-hidden="true"><i style={{ width: `${Math.max((item.amount / maximum) * 100, item.amount ? 2 : 0)}%` }} /></span>
+      </div>
+    })}</div> : <div className="product-rank-empty">No product sales for this selection</div>
+  }
 
-  return <section className={`product-rankings ${loading ? 'is-loading' : ''}`}>
+  const details = (data.details ?? []).filter((row) => !`${row.category} ${row.description}`.toLocaleLowerCase().includes('language lab'))
+  const channels = [...new Set(details.map((row) => row.channel))]
+  const categories = [...new Set(details.map((row) => row.category).filter(Boolean))]
+  const filteredDetails = details.filter((row) => (detailChannel === 'all' || row.channel === detailChannel) && (detailCategory === 'all' || row.category === detailCategory))
+  const filteredChannelRankings = channels.filter((channel) => detailChannel === 'all' || channel === detailChannel).map((channel) => {
+    const productTotals = new Map<string, number>()
+    filteredDetails.filter((row) => row.channel === channel).forEach((row) => productTotals.set(row.description, (productTotals.get(row.description) ?? 0) + row.total_invoice_value))
+    const ranked = [...productTotals].map(([name, amount]) => ({ name, amount })).sort((a, b) => b.amount - a.amount)
+    return { channel, count: ranked.length, top: ranked.slice(0, 5), bottom: [...ranked].reverse().slice(0, 5) }
+  })
+  const topProductChannels = [...filteredChannelRankings].sort((left, right) => (right.top[0]?.amount ?? 0) - (left.top[0]?.amount ?? 0))
+  const TOP_PRODUCT_BAR_BASELINE = Math.max(...topProductChannels.map((channel) => channel.top[0]?.amount ?? 0), 1)
+  const strongestChannel = topProductChannels[0]
+
+  return <section className={`product-rankings product-performance-page ${loading ? 'is-loading' : ''}`}>
     <div className="category-performance-head">
-      <div><span className="section-kicker">Product performance</span><h3>Top 5 / Bottom 5 Products</h3></div>
+      <div><span className="section-kicker">Product performance</span><h3>Product Performance</h3></div>
     </div>
+    <div className="product-detail-controls"><label><span>Channel</span><select value={detailChannel} onChange={(event) => setDetailChannel(event.target.value)}><option value="all">All Channels</option>{channels.map((channel) => <option key={channel}>{channel}</option>)}</select></label><label><span>Category</span><select value={detailCategory} onChange={(event) => setDetailCategory(event.target.value)}><option value="all">All Categories</option>{categories.map((category) => <option key={category}>{category}</option>)}</select></label></div>
+    {dateFilter}
+    <div className="category-performance-head product-ranking-head"><div><span className="section-kicker">Channel leaders</span><h3>Top Product by Channel</h3><p>{detailCategory === 'all' ? 'All categories' : detailCategory} · highest-selling product in each channel, selected period</p></div></div>
+    <div className="top-channel-products product-filtered-leaders" role="list" aria-label="Top product in each channel">{topProductChannels.map((channel) => {
+      const product = channel.top[0]
+      const [mainTitle, ...tailParts] = product?.name.split('|').map((part) => part.trim()) ?? []
+      const percentage = product ? (product.amount / TOP_PRODUCT_BAR_BASELINE) * 100 : 0
+      return <div className="top-channel-product" role="listitem" key={channel.channel}>
+        <strong className="top-channel-name">{channel.channel}</strong>
+        {product ? <><p title={product.name}><span>{mainTitle}</span>{tailParts.length > 0 && <small>{tailParts.join(' · ')}</small>}</p><strong className="top-product-value">{money(product.amount)}</strong><div className="top-product-bar" aria-hidden="true"><span style={{ width: `${percentage}%` }} /></div></> : <span className="detail-empty">No Data Available</span>}
+      </div>
+    })}<div className="top-product-footnote">Bar length compares each channel's top product with the strongest overall ({strongestChannel?.channel ?? 'No channel'}, {money(strongestChannel?.top[0]?.amount ?? 0)}).</div></div>
+    <div className="category-performance-head product-ranking-head"><div><span className="section-kicker">Product ranking</span><h3>Top 5 / Bottom 5 Products</h3></div></div>
     <div className="product-channel-sections">
-      {data.channels.map((channel) => <article className="product-channel-section" key={channel.id}>
-        <div className="product-channel-heading"><strong>{channel.label}</strong><span>{channel.item_label}</span></div>
+      {filteredChannelRankings.map((channel) => <article className="product-channel-section" key={channel.channel}>
+        <div className="product-channel-heading"><strong>{channel.channel}</strong><span className="product-range-summary"><b>Top</b><strong>{money(channel.top[0]?.amount ?? 0)}</strong><i>·</i><b>bottom</b><strong>{money(channel.bottom[0]?.amount ?? 0)}</strong></span></div>
+        {channel.top.some((top) => channel.bottom.some((bottom) => top.name === bottom.name)) && <div className="product-overlap-note">Only {channel.count} products with sales — lists overlap</div>}
         <div className="product-rankings-grid">
           <div className="product-rank-list">
-            <div className="product-rank-title top"><span>↑</span><div><strong>Top 5</strong><small>Highest sales</small></div></div>
+            <div className="product-rank-title top"><span>↓</span><div><strong>Top 5 · highest sales</strong><small>Largest to smallest</small></div></div>
             {list(channel.top, 'top')}
           </div>
           <div className="product-rank-list">
-            <div className="product-rank-title bottom"><span>↓</span><div><strong>Bottom 5</strong><small>Lowest sales</small></div></div>
+            <div className="product-rank-title bottom"><span>↑</span><div><strong>Bottom 5 · lowest sales</strong><small>Smallest to largest</small></div></div>
             {list(channel.bottom, 'bottom')}
           </div>
         </div>
       </article>)}
     </div>
+    <div className="product-ranking-footnote"><span><i className="top" />Share of that channel's top seller</span><span><i className="bottom" />Share of that list's highest value</span><small>Bars are scaled within each list and are not comparable across panels.</small></div>
   </section>
 }
 
@@ -732,7 +898,7 @@ function TopProductByChannel({
   loading: boolean
 }) {
   const money = (value: number) => `₹${Math.round(value).toLocaleString('en-IN')}`
-  return <section className={`dashboard-detail-card ${loading ? 'is-loading' : ''}`}>
+  return <section id="product-performance-visual" className={`dashboard-detail-card ${loading ? 'is-loading' : ''}`}>
     <div className="detail-card-head"><span className="detail-card-icon">★</span><div><span className="section-kicker">Channel leaders</span><h3>Top Product by Channel</h3></div></div>
     <div className="top-channel-products">
       {channels.map((channel) => {
@@ -749,41 +915,209 @@ function TopProductByChannel({
 function CustomersByEmail({
   data,
   loading,
+  period,
+  orderDetails,
 }: {
   data: DashboardData['customer_performance']
   loading: boolean
+  period: string
+  orderDetails: DashboardData['state_order_details']
 }) {
-  return <section className={`dashboard-detail-card ${loading ? 'is-loading' : ''}`}>
+  const [tableOpen, setTableOpen] = useState(false)
+  const [orderChannel, setOrderChannel] = useState('all')
+  const [cohort, setCohort] = useState<'new' | 'returning'>('new')
+  const filteredOrders = orderDetails.filter((row) => row.email && (orderChannel === 'all' || row.channel === orderChannel))
+  const emailCounts = filteredOrders.reduce<Record<string, number>>((counts, row) => { const email = row.email!.toLowerCase(); counts[email] = (counts[email] ?? 0) + 1; return counts }, {})
+  // Cohorts are mutually exclusive in the active filtered primary dataset.
+  const orders = filteredOrders.filter((row) => cohort === 'new'
+    ? emailCounts[row.email!.toLowerCase()] === 1
+    : emailCounts[row.email!.toLowerCase()] > 1)
+  useEffect(() => {
+    if (data.unique_customers + data.repeat_customers !== data.total_customers) console.warn('Customer mix totals do not reconcile.', data)
+  }, [data])
+  return <section id="customer-performance-visual" className={`dashboard-detail-card ${loading ? 'is-loading' : ''}`}>
+    <div className="customer-mix-card-head"><div><span className="section-kicker">Customer mix</span><h3>New vs returning customers</h3><p>New = first ever purchase in {period} · returning = purchased before</p></div><div className="customer-mix-total"><strong>{data.total_customers.toLocaleString('en-IN')}</strong><span>identified customers</span></div></div>
     <div className="detail-card-head"><span className="detail-card-icon">＠</span><div><span className="section-kicker">Customer frequency</span><h3>Customers by Email</h3></div></div>
-    {data.total_customers ? <div className="customer-mix">
-      <div className="customer-mix-bar" aria-label={`${Math.round(data.unique_percent)}% unique customers and ${Math.round(data.repeat_percent)}% repeat customers`}>
-        <span className="unique" style={{ width: `${data.unique_percent}%` }} />
-        <span className="repeat" style={{ width: `${data.repeat_percent}%` }} />
+    {data.total_customers ? <div className="customer-mix customer-mix-interactive" role="button" tabIndex={0} onClick={(event) => { setCohort((event.target as Element).classList.contains('repeat') ? 'returning' : 'new'); setTableOpen(true) }} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setTableOpen(true) } }}>
+      <div className="customer-mix-bar" aria-label={`${Math.round(data.unique_percent)}% new customers and ${Math.round(data.repeat_percent)}% returning customers`}>
+        <span className="unique" style={{ width: `${data.unique_percent}%` }}>New · {data.unique_customers.toLocaleString('en-IN')} · {Math.round(data.unique_percent)}%</span>
+        <span className="repeat" style={{ width: `${data.repeat_percent}%` }}>{data.repeat_customers.toLocaleString('en-IN')} · {Math.round(data.repeat_percent)}%</span>
       </div>
       <div className="customer-mix-values">
-        <div><span><i className="unique" />Unique Customers</span><strong>{Math.round(data.unique_percent)}%</strong><small>{data.unique_customers.toLocaleString('en-IN')} customers</small></div>
-        <div><span><i className="repeat" />Repeat Customers</span><strong>{Math.round(data.repeat_percent)}%</strong><small>{data.repeat_customers.toLocaleString('en-IN')} customers</small></div>
+        <div><span><i className="unique" />New customers</span><strong>{data.unique_customers.toLocaleString('en-IN')}</strong></div>
+        <div><span><i className="repeat" />Returning customers</span><strong>{data.repeat_customers.toLocaleString('en-IN')}</strong></div>
       </div>
-      <p>Total identified customers: <strong>{data.total_customers.toLocaleString('en-IN')}</strong></p>
     </div> : <div className="detail-empty detail-empty-large">No Data Available</div>}
+    {tableOpen && <div className="customer-orders"><label>Channel <select value={orderChannel} onChange={(event) => setOrderChannel(event.target.value)}><option value="all">All channels</option>{[...new Set(orderDetails.map((row) => row.channel))].map((channel) => <option key={channel} value={channel}>{channel}</option>)}</select></label><span>Date range: {period}</span><table><thead><tr><th>Year</th><th>Month</th><th>Channel</th><th>{cohort === 'new' ? 'New customer' : 'Returning customer'}</th><th>Email</th><th>Category</th><th>Description</th><th>Sales</th></tr></thead><tbody>{orders.map((row, index) => <tr key={`${row.order_id}-${index}`}><td>{row.year}</td><td>{row.month}</td><td>{row.channel}</td><td>{cohort === 'new' ? 'New' : 'Returning'}</td><td>{row.email}</td><td>{row.category}</td><td>{row.description}</td><td>{row.sales.toLocaleString('en-IN')}</td></tr>)}</tbody></table></div>}
   </section>
 }
 
-function StateWisePerformance({ rows, loading }: { rows: DashboardData['state_performance']; loading: boolean }) {
-  const visible = rows.slice(0, 10)
-  const maximum = Math.max(...visible.map((row) => row.amount), 1)
+const STATE_SHARE_COLLAPSE_THRESHOLD = 1
+const STATE_TAIL_COLLAPSE_MINIMUM = 5
+
+function StateWisePerformance({ rows, orderDetails, loading, filters }: { rows: DashboardData['state_performance']; orderDetails: DashboardData['state_order_details']; loading: boolean; filters?: React.ReactNode }) {
+  const [expandedTails, setExpandedTails] = useState<Record<string, boolean>>({})
+  const [ordersPageOpen, setOrdersPageOpen] = useState(false)
+  const [orderScope, setOrderScope] = useState<'india' | 'international' | 'invalid'>('india')
+  const [selectedState, setSelectedState] = useState<string | null>(null)
+  const [orderChannel, setOrderChannel] = useState('all')
+  const [orderCategory, setOrderCategory] = useState('all')
+  const [orderSort, setOrderSort] = useState<{ key: keyof DashboardData['state_order_details'][number]; direction: 'asc' | 'desc' }>({ key: 'year', direction: 'desc' })
   const total = rows.reduce((sum, row) => sum + Math.round(row.amount), 0)
-  return <section className={`dashboard-detail-card state-performance ${loading ? 'is-loading' : ''}`}>
+  const indianRows = rows.filter((row) => row.state.endsWith(', India'))
+  const invalidRows = rows.filter((row) => row.state === 'Unknown/Invalid')
+  const nonIndianRows = rows.filter((row) => !row.state.endsWith(', India') && row.state !== 'Unknown/Invalid')
+  const validRows = [...indianRows, ...nonIndianRows]
+  const maximum = Math.max(...validRows.map((row) => row.amount), 1)
+  const indianTotal = indianRows.reduce((sum, row) => sum + Math.round(row.amount), 0)
+  const nonIndianTotal = nonIndianRows.reduce((sum, row) => sum + Math.round(row.amount), 0)
+  const invalidTotal = invalidRows.reduce((sum, row) => sum + Math.round(row.amount), 0)
+  const invalidOrders = invalidRows.reduce((sum, row) => sum + (row.orders ?? 0), 0)
+  const share = (value: number) => total ? (value / total) * 100 : 0
+  const format = (value: number) => Math.round(value).toLocaleString('en-IN')
+  const shortName = (state: string, india: boolean) => {
+    if (india) return state.replace(/, India$/, '')
+    const separator = state.lastIndexOf(', ')
+    if (separator < 0) return state
+    const region = state.slice(0, separator)
+    const country = state.slice(separator + 2)
+    return `${region} · ${country === 'United States' ? 'US' : country}`
+  }
+  const countryTotals = nonIndianRows.reduce<Record<string, number>>((totals, row) => {
+    const separator = row.state.lastIndexOf(', ')
+    const country = separator < 0 ? 'Other' : row.state.slice(separator + 2)
+    const label = country === 'United States' ? 'US' : country
+    totals[label] = (totals[label] ?? 0) + Math.round(row.amount)
+    return totals
+  }, {})
+  const countryBreakdownEntries = Object.entries(countryTotals).sort((a, b) => b[1] - a[1])
+  const countryBreakdown = [
+    ...countryBreakdownEntries.slice(0, 3).map(([country, value]) => `${country} ${format(value)}`),
+    ...(countryBreakdownEntries.length > 3 ? [`Others ${format(countryBreakdownEntries.slice(3).reduce((sum, [, value]) => sum + value, 0))}`] : []),
+  ].join(' · ')
+  const groups = [
+    { id: 'india', title: 'India', noun: 'states', rows: indianRows, total: indianTotal, india: true, breakdown: '' },
+    { id: 'international', title: 'Other countries', noun: 'regions', rows: nonIndianRows, total: nonIndianTotal, india: false, breakdown: countryBreakdown },
+  ]
+  const topLocation = validRows.reduce<(typeof validRows)[number] | undefined>((top, row) => !top || row.amount > top.amount ? row : top, undefined)
+  const scopedOrderDetails = orderDetails.filter((row) => row.classification === orderScope && (!selectedState || row.state === selectedState))
+  const orderChannels = [...new Set(scopedOrderDetails.map((row) => row.channel).filter(Boolean))].sort()
+  const orderCategories = [...new Set(scopedOrderDetails.map((row) => row.category).filter(Boolean))].sort()
+  const visibleOrderDetails = scopedOrderDetails
+    .filter((row) => (orderChannel === 'all' || row.channel === orderChannel) && (orderCategory === 'all' || row.category === orderCategory))
+    .sort((a, b) => {
+      const left = a[orderSort.key]
+      const right = b[orderSort.key]
+      const comparison = typeof left === 'number' && typeof right === 'number' ? left - right : String(left).localeCompare(String(right))
+      return orderSort.direction === 'asc' ? comparison : -comparison
+    })
+  const visibleOrderQuantity = visibleOrderDetails.reduce((sum, row) => sum + row.quantity, 0)
+  const visibleOrderSales = visibleOrderDetails.reduce((sum, row) => sum + row.sales, 0)
+  const sortOrders = (key: keyof DashboardData['state_order_details'][number]) => setOrderSort((current) => ({ key, direction: current.key === key && current.direction === 'asc' ? 'desc' : 'asc' }))
+  const downloadVisibleOrders = () => downloadCsv(
+    `state-orders-${selectedState ?? orderScope}.csv`,
+    ['Year', 'Month', 'Channel', 'Category', 'Description', 'QTY', 'Sales'],
+    visibleOrderDetails.map((row) => [row.year, new Date(2000, row.month - 1, 1).toLocaleString('en-IN', { month: 'short' }), row.channel, row.category, row.description, row.quantity, row.sales]),
+  )
+  const selectOrderScope = (scope: 'india' | 'international' | 'invalid') => {
+    setOrderScope(scope)
+    setSelectedState(null)
+    setOrderChannel('all')
+    setOrderCategory('all')
+    setOrdersPageOpen(true)
+  }
+
+  useEffect(() => {
+    if (indianTotal + nonIndianTotal + invalidTotal !== total) {
+      console.warn('State Wise Performance totals do not reconcile.', { indianTotal, nonIndianTotal, invalidTotal, total })
+    }
+  }, [indianTotal, nonIndianTotal, invalidTotal, total])
+  useEffect(() => {
+    // TODO: Verify Texas and Washington against raw order addresses; do not alter them here.
+    if (rows.some((row) => row.state.startsWith('Texas, ') || row.state.startsWith('Washington, '))) console.warn('Location data check: verify Texas and Washington against raw order addresses.')
+    // TODO: Confirm whether Gujarat is genuine new business or reflects a location-mapping change.
+    if (rows.some((row) => row.state === 'Gujarat, India')) console.warn('Location data check: confirm the Gujarat mapping/change against the source period.')
+  }, [rows])
+  return <section id="state-performance-visual" className={`dashboard-detail-card state-performance ${ordersPageOpen ? 'state-orders-page-open' : ''} ${loading ? 'is-loading' : ''}`}>
+    <div className="state-location-header"><div><span className="section-kicker">Geographic sales</span><h3>Sales by location</h3></div><div className="state-location-summary"><strong>{format(total)}</strong><span>{rows.length} {rows.length === 1 ? 'location' : 'locations'}</span></div></div>
     <div className="detail-card-head"><span className="detail-card-icon">⌖</span><div><span className="section-kicker">Geographic sales</span><h3>State Wise Performance</h3></div></div>
-    {visible.length ? <>
-      <div className="state-performance-list">
-        {visible.map((row, index) => <div className="state-performance-row" key={row.state}>
-          <span className="state-rank">{index + 1}</span>
-          <div><div><span>{row.state}</span><strong>{Math.round(row.amount).toLocaleString('en-IN')}</strong></div><div className="state-performance-bar"><span style={{ width: `${Math.max((row.amount / maximum) * 100, row.amount ? 2 : 0)}%` }} /></div></div>
-        </div>)}
+    {filters}
+    {rows.length ? <div className="state-location-content">
+      <div className="state-location-proportion" aria-label={`India ${share(indianTotal).toFixed(1)}%, other countries ${share(nonIndianTotal).toFixed(1)}%, unknown ${share(invalidTotal).toFixed(1)}%`}>
+        {indianTotal > 0 && <span className="india" title={`India: ${format(indianTotal)} (${share(indianTotal).toFixed(1)}%)`} style={{ width: `${share(indianTotal)}%` }} />}
+        {nonIndianTotal > 0 && <button type="button" className="international" aria-label={`View other-country orders: ${format(nonIndianTotal)} (${share(nonIndianTotal).toFixed(1)}%)`} aria-pressed={orderScope === 'international'} title={`Other countries: ${format(nonIndianTotal)} (${share(nonIndianTotal).toFixed(1)}%)`} onClick={() => selectOrderScope('international')} style={{ width: `${share(nonIndianTotal)}%` }} />}
+        {invalidTotal > 0 && <button type="button" className="invalid" aria-label={`View unknown-location orders: ${format(invalidTotal)} (${share(invalidTotal).toFixed(1)}%)`} aria-pressed={orderScope === 'invalid'} title={`Unknown: ${format(invalidTotal)} (${share(invalidTotal).toFixed(1)}%)`} onClick={() => selectOrderScope('invalid')} style={{ width: `${share(invalidTotal)}%` }} />}
       </div>
-      <div className="state-performance-total"><span>Total sales across {rows.length} locations</span><strong>{Math.round(total).toLocaleString('en-IN')}</strong></div>
-    </> : <div className="detail-empty detail-empty-large">No state data available</div>}
+      <div className="state-location-legend">
+        <span><i className="india" />India <strong>{format(indianTotal)}</strong> ({share(indianTotal).toFixed(1)}%)</span>
+        <span><i className="international" />Other countries <strong>{format(nonIndianTotal)}</strong> ({share(nonIndianTotal).toFixed(1)}%)</span>
+        <span><i className="invalid" />Unknown <strong>{format(invalidTotal)}</strong> ({share(invalidTotal).toFixed(1)}%)</span>
+      </div>
+      <div className="state-location-groups">
+        {groups.map((group) => {
+          const tailRows = group.rows.filter((row) => share(row.amount) < STATE_SHARE_COLLAPSE_THRESHOLD)
+          const collapseTail = tailRows.length > STATE_TAIL_COLLAPSE_MINIMUM
+          const tailExpanded = Boolean(expandedTails[group.id])
+          const displayedRows = collapseTail && !tailExpanded ? group.rows.filter((row) => share(row.amount) >= STATE_SHARE_COLLAPSE_THRESHOLD) : group.rows
+          const tailTotal = tailRows.reduce((sum, row) => sum + Math.round(row.amount), 0)
+          return <section className="state-location-group" key={group.title}>
+          <div className="state-location-group-head">
+            <h4>{group.title} <span>· {group.rows.length} {group.rows.length === 1 ? group.noun.slice(0, -1) : group.noun}</span></h4>
+            {group.breakdown && <small>{group.breakdown}</small>}
+            <strong>{format(group.total)}</strong>
+          </div>
+          <div className="state-location-rows">
+            {displayedRows.length ? displayedRows.map((row) => <div className={`state-location-row state-location-selectable${selectedState === row.state ? ' is-selected' : ''}`} key={row.state} role="button" tabIndex={0} aria-label={`View orders for ${row.state}`} onClick={() => { setOrderScope(group.india ? 'india' : 'international'); setSelectedState(row.state); setOrderChannel('all'); setOrderCategory('all'); setOrdersPageOpen(true) }} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setOrderScope(group.india ? 'india' : 'international'); setSelectedState(row.state); setOrderChannel('all'); setOrderCategory('all'); setOrdersPageOpen(true) } }}>
+              <span className="state-location-name">{shortName(row.state, group.india)}</span>
+              <span className={`state-location-bar ${group.india ? 'india' : 'international'}`} aria-hidden="true"><i style={{ width: `${Math.max((row.amount / maximum) * 100, row.amount ? 1 : 0)}%` }} /></span>
+              <strong>{format(row.amount)}</strong>
+              <span className="state-location-share">{share(row.amount).toFixed(1)}%</span>
+            </div>) : <p className="state-location-empty">No data available</p>}
+            {collapseTail && <div className="state-location-row state-location-tail-summary">
+              <button type="button" aria-expanded={tailExpanded} onClick={() => setExpandedTails((current) => ({ ...current, [group.id]: !tailExpanded }))}><span aria-hidden="true">{tailExpanded ? '⌃' : '⌄'}</span>{tailRows.length} {group.noun} below {STATE_SHARE_COLLAPSE_THRESHOLD}%</button>
+              <span />
+              <strong>{format(tailTotal)}</strong>
+              <span className="state-location-share">{share(tailTotal).toFixed(1)}%</span>
+            </div>}
+          </div>
+        </section> })}
+      </div>
+      {invalidTotal > 0 && <div className="state-location-warning" role="note">
+        <span className="state-location-warning-icon" aria-hidden="true">!</span>
+        <button type="button" onClick={() => selectOrderScope('invalid')}>View orders</button>
+        <p>Unknown / invalid location <strong>{' · '}{format(invalidTotal)}</strong> across <strong>{invalidOrders.toLocaleString('en-IN')} orders</strong></p>
+      </div>}
+      <div className="state-location-grand-total"><span>Grand total {' · '}{rows.length} {rows.length === 1 ? 'location' : 'locations'}</span><i /><strong>{format(total)}</strong><span>100%</span></div>
+      {topLocation && <p className="state-location-footnote">Bars scaled against {shortName(topLocation.state, topLocation.state.endsWith(', India'))} ({format(topLocation.amount)}). Share % is of the {format(total)} total.</p>}
+      <section className="state-orders-detail" aria-labelledby="state-orders-title">
+        <button className="state-orders-back" type="button" onClick={() => setOrdersPageOpen(false)}>← Back to State Performance</button>
+        <div className="state-orders-head"><div><span className="section-kicker">Order drill-down</span><h4 id="state-orders-title">View Orders</h4></div><div className="state-orders-head-actions"><span>{visibleOrderDetails.length.toLocaleString('en-IN')} rows</span><button type="button" disabled={!visibleOrderDetails.length} onClick={downloadVisibleOrders}>↓ Download CSV</button></div></div>
+        <div className="state-orders-scopes" role="group" aria-label="Order location category">
+          {([
+            ['india', 'India'],
+            ['international', 'Other Countries'],
+            ['invalid', 'Unknown / Invalid Location'],
+          ] as const).map(([scope, label]) => <button className={orderScope === scope ? 'active' : ''} type="button" key={scope} onClick={() => selectOrderScope(scope)}>{label}</button>)}
+        </div>
+        {selectedState && <div className="state-orders-selection"><span>Showing orders for <strong>{selectedState}</strong></span><button type="button" onClick={() => setSelectedState(null)}>Clear state</button></div>}
+        <div className="state-orders-filters">
+          <label><span>Channel</span><select value={orderChannel} onChange={(event) => setOrderChannel(event.target.value)}><option value="all">All Channels</option>{orderChannels.map((channel) => <option value={channel} key={channel}>{channel}</option>)}</select></label>
+          <label><span>Category</span><select value={orderCategory} onChange={(event) => setOrderCategory(event.target.value)}><option value="all">All Categories</option>{orderCategories.map((category) => <option value={category} key={category}>{category}</option>)}</select></label>
+        </div>
+        <div className="state-orders-table-wrap">
+          <table className="state-orders-table">
+            <thead><tr>{([
+              ['year', 'Year'], ['month', 'Month'], ['channel', 'Channel'],
+              ['category', 'Category'], ['description', 'Description'], ['quantity', 'QTY'], ['sales', 'Sales'],
+            ] as const).map(([key, label]) => <th key={key}><button type="button" onClick={() => sortOrders(key)}>{label}{orderSort.key === key ? <span aria-hidden="true">{orderSort.direction === 'asc' ? ' ↑' : ' ↓'}</span> : null}</button></th>)}</tr></thead>
+            <tbody>{visibleOrderDetails.length ? visibleOrderDetails.map((row, index) => <tr key={`${row.channel}-${row.order_id}-${row.state}-${index}`}>
+              <td>{row.year}</td><td>{new Date(2000, row.month - 1, 1).toLocaleString('en-IN', { month: 'short' })}</td><td>{row.channel}</td><td>{row.category || '—'}</td><td>{row.description || '—'}</td><td>{row.quantity.toLocaleString('en-IN')}</td><td>{format(row.sales)}</td>
+            </tr>) : <tr><td className="state-orders-empty" colSpan={7}>No orders available for this location category.</td></tr>}</tbody>
+            {visibleOrderDetails.length > 0 && <tfoot><tr><th colSpan={5}>Grand Total · {visibleOrderDetails.length.toLocaleString('en-IN')} rows</th><th>{visibleOrderQuantity.toLocaleString('en-IN')}</th><th>{format(visibleOrderSales)}</th></tr></tfoot>}
+          </table>
+        </div>
+      </section>
+    </div> : <div className="detail-empty detail-empty-large">No state data available</div>}
   </section>
 }
 
@@ -811,11 +1145,28 @@ function DashboardPage() {
   const [draftYear, setDraftYear] = useState(initialFilters.year)
   const [draftComparison, setDraftComparison] = useState<TimeSelection>(initialFilters.comparison)
   const [draftComparisonYear, setDraftComparisonYear] = useState(initialFilters.comparisonYear)
+  const [dateFilterMode, setDateFilterMode] = useState<'date' | 'month' | 'range'>('range')
+  const [dateStart, setDateStart] = useState('')
+  const [dateEnd, setDateEnd] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [expanded, setExpanded] = useState<Set<string>>(new Set(['zero_rated', 'exempted', 'taxable', 'pnl']))
+  const [expanded, setExpanded] = useState<string | null>(null)
+  const [categoryPeriodView, setCategoryPeriodView] = useState<'both' | 'current' | 'comparison'>('both')
+  const [channelPeriodView, setChannelPeriodView] = useState<'both' | 'current' | 'comparison'>('both')
+  const [selectedChannelCell, setSelectedChannelCell] = useState<string | null>(null)
+  const [dashboardView, setDashboardView] = useState<'overview' | 'product' | 'state' | 'customer'>('overview')
+  const [categoryChannel, setCategoryChannel] = useState('all')
+  const [categoryTableData, setCategoryTableData] = useState<DashboardData | null>(null)
+  const [categoryTableLoading, setCategoryTableLoading] = useState(false)
+  const [categorySort, setCategorySort] = useState<{ key: string; direction: 'asc' | 'desc' }>({ key: 'category', direction: 'asc' })
+  const useLatestDataPeriod = useRef(shouldUseLatestDashboardPeriod(initialYear, initialMonth))
+  const skipDashboardFetch = useRef(false)
 
   useEffect(() => {
+    if (skipDashboardFetch.current) {
+      skipDashboardFetch.current = false
+      return
+    }
     let active = true
     const query = new URLSearchParams({ channel: selected, grain: time.grain })
     if (time.period) query.set('period', time.period)
@@ -823,7 +1174,16 @@ function DashboardPage() {
     query.set('comparison_grain', comparison.grain)
     query.set('comparison_period', comparison.period)
     query.set('comparison_year', String(comparisonYear))
-    fetch(`/api/dashboard/kpis?${query}`)
+    if (useLatestDataPeriod.current && time.grain === 'monthly') query.set('latest', 'true')
+    const requestUrl = `/api/dashboard/kpis?${query}`
+    const cached = dashboardResponseCache.get(requestUrl)
+    if (cached && Date.now() - cached.storedAt < DASHBOARD_CACHE_TTL_MS) {
+      setData(cached.data)
+      setError('')
+      setLoading(false)
+      return () => { active = false }
+    }
+    fetch(requestUrl)
       .then(async (response) => {
         const contentType = response.headers.get('content-type') ?? ''
         if (!contentType.includes('application/json')) {
@@ -839,6 +1199,22 @@ function DashboardPage() {
       })
       .then((result: DashboardData) => {
         if (active) {
+          dashboardResponseCache.set(requestUrl, { data: result, storedAt: Date.now() })
+          if (useLatestDataPeriod.current && time.grain === 'monthly') {
+            useLatestDataPeriod.current = false
+            const latestYear = result.selected_year
+            const latestMonth = Number(result.selected_period)
+            if (latestYear !== activeYear || String(latestMonth) !== time.period) {
+                const previous = new Date(latestYear, latestMonth - 2, 1)
+                const latestTime = { grain: 'monthly' as const, period: String(latestMonth) }
+                const previousTime = { grain: 'monthly' as const, period: String(previous.getMonth() + 1) }
+                skipDashboardFetch.current = true
+                setTime(latestTime); setActiveYear(latestYear)
+                setComparison(previousTime); setComparisonYear(previous.getFullYear())
+                setDraftTime(latestTime); setDraftYear(latestYear)
+                setDraftComparison(previousTime); setDraftComparisonYear(previous.getFullYear())
+            }
+          }
           setData(result)
           setError('')
         }
@@ -848,28 +1224,55 @@ function DashboardPage() {
     return () => { active = false }
   }, [selected, time, activeYear, comparison, comparisonYear])
 
+  useEffect(() => {
+    if (categoryChannel === 'all') { setCategoryTableData(null); return }
+    const controller = new AbortController()
+    const query = new URLSearchParams({ channel: categoryChannel, grain: time.grain, period: time.period, year: String(activeYear), comparison_grain: comparison.grain, comparison_period: comparison.period, comparison_year: String(comparisonYear) })
+    setCategoryTableLoading(true)
+    fetch(`/api/dashboard/kpis?${query}`, { signal: controller.signal })
+      .then(async (response) => { const result = await response.json(); if (!response.ok) throw new Error(result.detail ?? 'Unable to filter category performance.'); return result })
+      .then((result: DashboardData) => setCategoryTableData(result))
+      .catch((reason: unknown) => { if (!(reason instanceof DOMException && reason.name === 'AbortError')) setError(reason instanceof Error ? reason.message : 'Unable to filter category performance.') })
+      .finally(() => setCategoryTableLoading(false))
+    return () => controller.abort()
+  }, [categoryChannel, time, activeYear, comparison, comparisonYear])
+
   const applyFilters = () => {
-    const appliedTime = draftTime.grain === 'yearly' ? { ...draftTime, period: String(draftYear) } : draftTime
+    useLatestDataPeriod.current = false
+    let appliedTime = draftTime.grain === 'yearly' ? { ...draftTime, period: String(draftYear) } : draftTime
+    let appliedYear = draftYear
+    if (dateStart) {
+      const start = new Date(`${dateStart}${dateFilterMode === 'month' ? '-01' : ''}T00:00:00`)
+      const endValue = dateFilterMode === 'range' && dateEnd ? dateEnd : dateStart
+      const end = new Date(`${endValue}${dateFilterMode === 'month' ? '-01' : ''}T00:00:00`)
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) { setError('Choose a valid date range.'); return }
+      if (start.getFullYear() !== end.getFullYear()) { setError('Custom date ranges must stay within one calendar year.'); return }
+      const selectedMonths = Array.from({ length: end.getMonth() - start.getMonth() + 1 }, (_, index) => String(start.getMonth() + index + 1))
+      appliedTime = { grain: 'monthly', period: selectedMonths.join(',') }
+      appliedYear = start.getFullYear()
+    }
     const appliedComparison = draftComparison.grain === 'yearly' ? { ...draftComparison, period: String(draftComparisonYear) } : draftComparison
     setLoading(true)
     setSelected(draftChannel)
     setTime(appliedTime)
-    setActiveYear(draftYear)
+    setActiveYear(appliedYear)
     setComparison(appliedComparison)
     setComparisonYear(draftComparisonYear)
     localStorage.setItem(DASHBOARD_FILTERS_KEY, JSON.stringify({
-      channel: draftChannel, time: appliedTime, year: draftYear,
+      channel: draftChannel, time: appliedTime, year: appliedYear,
       comparison: appliedComparison, comparisonYear: draftComparisonYear,
     }))
   }
 
   const resetFilters = () => {
     localStorage.removeItem(DASHBOARD_FILTERS_KEY)
+    useLatestDataPeriod.current = true
     setLoading(true)
     setSelected(defaults.channel); setTime(defaults.time); setActiveYear(defaults.year)
     setComparison(defaults.comparison); setComparisonYear(defaults.comparisonYear)
     setDraftChannel(defaults.channel); setDraftTime(defaults.time); setDraftYear(defaults.year)
     setDraftComparison(defaults.comparison); setDraftComparisonYear(defaults.comparisonYear)
+    setDateStart(''); setDateEnd(''); setDateFilterMode('range')
   }
 
   const selectGrain = (grain: TimeSelection['grain']) => {
@@ -882,16 +1285,16 @@ function DashboardPage() {
     : selection.grain === 'quarterly'
       ? quarters.map((label, index) => ({ value: String(index + 1), label }))
       : [{ value: selection.period, label: 'Full year' }]
+  const periodDisplay = (selection: TimeSelection, year: number) => selection.grain === 'monthly'
+    ? selection.period.split(',').filter(Boolean).map((month) => months[Number(month) - 1]?.slice(0, 3)).filter(Boolean).join(', ') + ` ${year}`
+    : selection.grain === 'quarterly'
+      ? `Q${selection.period} ${year}`
+      : `Full year ${year}`
 
   const number = (value: number) => Math.round(value).toLocaleString('en-IN')
   const variance = (actual: number, plan: number) => actual - plan
   const variancePercent = (actual: number, plan: number) => plan ? ((actual - plan) / plan) * 100 : 0
-  const toggle = (id: string) => setExpanded((current) => {
-    const next = new Set(current)
-    if (next.has(id)) next.delete(id)
-    else next.add(id)
-    return next
-  })
+  const toggle = (id: string) => setExpanded((current) => current === id ? null : id)
   const yearOptions = data
     ? [...new Set([initialYear, initialYear - 1, ...data.available_years])].sort((a, b) => b - a)
     : [initialYear, initialYear - 1]
@@ -901,19 +1304,34 @@ function DashboardPage() {
     data?.channel_wise_performance[period][channel] ?? 0
   const authoritativeCurrentTotal = Math.round(channelActual('current', 'Total Sales'))
   const authoritativeComparisonTotal = Math.round(channelActual('comparison', 'Total Sales'))
+  const categorySource = categoryTableData ?? data
+  const categorySourceCurrentTotal = Math.round(categorySource?.channel_wise_performance.current['Total Sales'] ?? 0)
+  const categorySourceComparisonTotal = Math.round(categorySource?.channel_wise_performance.comparison['Total Sales'] ?? 0)
   const categoryCurrentActuals = reconciledWholeValues(
-    data?.category_performance.map((row) => row.current.actual) ?? [],
-    authoritativeCurrentTotal,
+    categorySource?.category_performance.map((row) => row.current.actual) ?? [],
+    categorySourceCurrentTotal,
   )
   const categoryComparisonActuals = reconciledWholeValues(
-    data?.category_performance.map((row) => row.comparison.actual) ?? [],
-    authoritativeComparisonTotal,
+    categorySource?.category_performance.map((row) => row.comparison.actual) ?? [],
+    categorySourceComparisonTotal,
   )
-  const categoryPerformance = data?.category_performance.map((row, index) => ({
+  const categoryPerformance = categorySource?.category_performance.map((row, index) => ({
     ...row,
     current: { ...row.current, actual: categoryCurrentActuals[index] },
     comparison: { ...row.comparison, actual: categoryComparisonActuals[index] },
   })) ?? []
+  const categoryCurrentPlanTotal = categoryPerformance.reduce((sum, row) => sum + Math.round(row.current.plan), 0)
+  const categoryComparisonPlanTotal = categoryPerformance.reduce((sum, row) => sum + Math.round(row.comparison.plan), 0)
+  const categoryCurrentDifference = variance(categorySourceCurrentTotal, categoryCurrentPlanTotal)
+  const categoryComparisonDifference = variance(categorySourceComparisonTotal, categoryComparisonPlanTotal)
+  const categorySortValue = (row: (typeof categoryPerformance)[number], key: string) => key === 'category' ? row.category : key === 'currentPlan' ? row.current.plan : key === 'currentActual' ? row.current.actual : key === 'currentVariance' ? variance(row.current.actual, row.current.plan) : key === 'currentVariancePercent' ? variancePercent(row.current.actual, row.current.plan) : key === 'comparisonPlan' ? row.comparison.plan : key === 'comparisonActual' ? row.comparison.actual : key === 'comparisonVariance' ? variance(row.comparison.actual, row.comparison.plan) : variancePercent(row.comparison.actual, row.comparison.plan)
+  const sortedCategoryPerformance = [...categoryPerformance].sort((left, right) => {
+    const a = categorySortValue(left, categorySort.key); const b = categorySortValue(right, categorySort.key)
+    const order = typeof a === 'string' && typeof b === 'string' ? a.localeCompare(b) : Number(a) - Number(b)
+    return categorySort.direction === 'asc' ? order : -order
+  })
+  const toggleCategorySort = (key: string) => setCategorySort((current) => ({ key, direction: current.key === key && current.direction === 'asc' ? 'desc' : 'asc' }))
+  const varianceHeatClass = (value: number) => `variance-heat ${value > 100 ? 'over-100' : value >= 0 ? 'above' : value >= -25 ? 'miss-25' : value >= -50 ? 'miss-50' : value >= -75 ? 'miss-75' : 'miss-100'}`
   const coreChannels = [
     { channel: 'Digital Online', monthlyPlan: CHANNEL_MONTHLY_PLANS.digitalOnline },
     { channel: 'Stall Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.stallSales },
@@ -943,6 +1361,28 @@ function DashboardPage() {
     { channel: 'OTT', monthlyPlan: CHANNEL_MONTHLY_PLANS.ott, currentActual: channelActual('current', 'OTT'), comparisonActual: channelActual('comparison', 'OTT') },
     { channel: 'Grand Total Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.grandTotal, currentActual: Math.round(channelActual('current', 'Grand Total Sales')), comparisonActual: Math.round(channelActual('comparison', 'Grand Total Sales')) },
   ]
+  const channelCurrentPlanTotal = CHANNEL_MONTHLY_PLANS.grandTotal * currentPlanMonths
+  const channelComparisonPlanTotal = CHANNEL_MONTHLY_PLANS.grandTotal * comparisonPlanMonths
+  const channelCurrentActualTotal = channelPerformance[7].currentActual
+  const channelComparisonActualTotal = channelPerformance[7].comparisonActual
+  const channelVarianceClass = (value: number) => `channel-variance-percent ${value > 100 ? 'over-100' : value >= 0 ? 'above' : value >= -25 ? 'miss-25' : value >= -50 ? 'miss-50' : value >= -75 ? 'miss-75' : 'miss-100'}`
+  const channelCellProps = (key: string, className = '') => ({
+    className: `${className}${selectedChannelCell === key ? ' is-selected' : ''}`.trim(),
+    tabIndex: 0,
+    'aria-selected': selectedChannelCell === key,
+    onClick: () => setSelectedChannelCell(key),
+    onFocus: () => setSelectedChannelCell(key),
+  })
+
+  const activeCurrentSum = currentChannelActuals.reduce((sum, value) => sum + value, 0)
+  const activeComparisonSum = comparisonChannelActuals.reduce((sum, value) => sum + value, 0)
+  const subtotalPlan = coreChannels.reduce((sum, row) => sum + row.monthlyPlan, 0)
+  const inactivePlan = CHANNEL_MONTHLY_PLANS.languageLab + CHANNEL_MONTHLY_PLANS.ott
+  useEffect(() => {
+    if (activeCurrentSum !== authoritativeCurrentTotal) console.warn(`Channel performance mismatch: current subtotal is ${authoritativeCurrentTotal}, expected ${activeCurrentSum}.`)
+    if (activeComparisonSum !== authoritativeComparisonTotal) console.warn(`Channel performance mismatch: comparison subtotal is ${authoritativeComparisonTotal}, expected ${activeComparisonSum}.`)
+    if (subtotalPlan + inactivePlan !== CHANNEL_MONTHLY_PLANS.grandTotal) console.warn('Channel performance mismatch: grand total plan does not equal subtotal plan plus no-activity plans.')
+  }, [activeCurrentSum, activeComparisonSum, authoritativeCurrentTotal, authoritativeComparisonTotal, subtotalPlan, inactivePlan])
   const performanceHeaders = [
     'Name',
     'Current Plan', 'Current Actual', 'Current Variance', 'Current Variance %',
@@ -984,8 +1424,48 @@ function DashboardPage() {
       ]
     }),
   )
+  const clearVisualDateRange = () => {
+    const restoredTime = draftTime.grain === 'yearly' ? { ...draftTime, period: String(draftYear) } : draftTime
+    useLatestDataPeriod.current = false
+    setDateStart('')
+    setDateEnd('')
+    setLoading(true)
+    setTime(restoredTime)
+    setActiveYear(draftYear)
+    localStorage.setItem(DASHBOARD_FILTERS_KEY, JSON.stringify({
+      channel: selected,
+      time: restoredTime,
+      year: draftYear,
+      comparison,
+      comparisonYear,
+    }))
+  }
+  const renderDateRangeFilter = () => <div className="visual-date-filter-row"><div className="dashboard-date-filter">
+    <span className="filter-label"><Icon name="calendar" size={14} /> Date range</span>
+    <label><span>Type</span><select value={dateFilterMode} onChange={(event) => { setDateFilterMode(event.target.value as typeof dateFilterMode); setDateStart(''); setDateEnd('') }}><option value="date">Specific date</option><option value="month">Month</option><option value="range">Custom range</option></select></label>
+    <label><span>{dateFilterMode === 'range' ? 'From' : dateFilterMode === 'month' ? 'Month' : 'Date'}</span><input type={dateFilterMode === 'month' ? 'month' : 'date'} value={dateStart} onChange={(event) => setDateStart(event.target.value)} /></label>
+    {dateFilterMode === 'range' && <label><span>To</span><input type="date" min={dateStart || undefined} value={dateEnd} onChange={(event) => setDateEnd(event.target.value)} /></label>}
+    <div className="date-filter-actions"><button className="date-clear-button" type="button" disabled={!dateStart && !dateEnd} onClick={clearVisualDateRange}>Clear</button><button className="date-apply-button" type="button" disabled={!dateStart} onClick={applyFilters}>Apply</button></div>
+  </div></div>
+  const renderStateFilters = () => <div className="state-visual-filters"><div className="product-detail-controls"><label><span>Channel</span><select value={selected} onChange={(event) => { const channel = event.target.value; setDraftChannel(channel); setLoading(true); setSelected(channel) }}><option value="all">All Channels</option><option value="dsg">DSG</option><option value="sfh">SFH</option><option value="amazon">Amazon</option><option value="direct">Direct Sales</option></select></label></div>{renderDateRangeFilter()}</div>
+  const renderPerformanceSummary = (currentTotal: number, currentDifference: number, comparisonTotal: number, comparisonDifference: number) => <div className="performance-summary" aria-label="Performance totals and differences">
+    <div className="summary-period"><span>Current period</span><div><small>Total actual</small><strong>{number(currentTotal)}</strong></div><div><small>Difference</small><strong className={currentDifference >= 0 ? 'positive' : 'negative'}>{currentDifference >= 0 ? '+' : '−'}{number(Math.abs(currentDifference))}</strong></div></div>
+    <div className="summary-period is-comparison"><span>Comparison period</span><div><small>Total actual</small><strong>{number(comparisonTotal)}</strong></div><div><small>Difference</small><strong className={comparisonDifference >= 0 ? 'positive' : 'negative'}>{comparisonDifference >= 0 ? '+' : '−'}{number(Math.abs(comparisonDifference))}</strong></div></div>
+  </div>
 
   if (loading && !data) return <div className="content"><div className="dashboard-loading">Calculating reviewed sales KPIs…</div></div>
+  if (data && dashboardView !== 'overview') {
+    const pageTitle = dashboardView === 'product' ? 'Product performance' : dashboardView === 'state' ? 'State performance' : 'Customer performance'
+    return <div className="content dashboard-page dashboard-subpage">
+      <section className="dashboard-subpage-head"><button type="button" onClick={() => setDashboardView('overview')}>← Back to dashboard</button><div><span className="section-kicker">Performance detail</span><h2>{pageTitle}</h2><p>Using the active dashboard channel and period filters.</p></div></section>
+      {error && <div className="error-message dashboard-error"><Icon name="info" size={18} /><span>{error}</span></div>}
+      <div className="dashboard-subpage-content">
+        {dashboardView === 'product' && <ProductRankings data={data.product_performance} loading={loading} dateFilter={renderDateRangeFilter()} />}
+        {dashboardView === 'state' && <StateWisePerformance rows={data.state_performance} orderDetails={data.state_order_details ?? []} loading={loading} filters={renderStateFilters()} />}
+        {dashboardView === 'customer' && <CustomersByEmail data={data.customer_performance} loading={loading} period={periodDisplay(time, activeYear)} orderDetails={data.state_order_details ?? []} />}
+      </div>
+    </div>
+  }
   return (
     <div className="content dashboard-page">
       <section className="intro"><div><span className="section-kicker">Reviewed sales data</span><h2>Sales KPI Dashboard</h2><p>Consolidated performance with channel filtering, category breakdowns, and monthly trends.</p></div></section>
@@ -1008,14 +1488,18 @@ function DashboardPage() {
             </div>)}
           </div>
           <div className="comparison-channels"><span className="filter-label">Channel</span><div className="dashboard-filters">
-            {[...data.filters, { id: 'amazon', label: 'Amazon' }].map((filter) => {
-              const unavailable = filter.id === 'amazon'
-              return <button className={draftChannel === filter.id ? 'active' : ''} disabled={unavailable} title={unavailable ? 'Not integrated' : undefined} key={filter.id} onClick={() => {
-                setDraftChannel(filter.id)
+            {data.filters.map((filter) => {
+              if (filter.id === 'all') return <select className={`all-channels-select ${draftChannel === 'all' ? 'active' : ''}`} aria-label="All Channels" value={draftChannel} key={filter.id} onChange={(event) => {
+                const channel = event.target.value
+                setDraftChannel(channel)
                 setLoading(true)
-                setSelected(filter.id)
-              }}>{filter.label}</button>
+                setSelected(channel)
+              }}><option value="all">All Channels</option><option value="dsg">DSG</option><option value="sfh">SFH</option><option value="amazon">Amazon</option><option value="direct">Direct Sales</option></select>
+              return null
             })}
+            <button className="product-performance-button" type="button" onClick={() => setDashboardView('product')}>Product performance <span aria-hidden="true">→</span></button>
+            <button type="button" onClick={() => setDashboardView('state')}>State performance</button>
+            <button type="button" onClick={() => setDashboardView('customer')}>Customer performance</button>
           </div></div>
         </div>
         <div className="dashboard-filter-groups">
@@ -1047,10 +1531,11 @@ function DashboardPage() {
         </div>
         <section className={`kpi-grid ${selected !== 'all' ? 'channel-view' : ''} ${loading ? 'is-loading' : ''}`}>
           {data.cards.map((card) => {
-            const isExpanded = expanded.has(card.id)
+            const isExpanded = expanded === card.id
             const trend = trendDetails(card.trend)
             const isAllChannelsPnl = selected === 'all' && card.id === 'pnl'
             const isAllChannelsTaxCard = selected === 'all' && ['zero_rated', 'exempted', 'taxable'].includes(card.id)
+            const isOrderCountCard = card.id === 'orders'
             const comparison = periodComparison(card)
             const plan = getPlanForGrain(TOTAL_SALES_MONTHLY_PLAN, time.grain, time.period)
             const achievement = Math.round((card.total / plan) * 100)
@@ -1069,21 +1554,18 @@ function DashboardPage() {
               displayBreakdown[adjustmentIndex].value += difference
             }
             if (selected !== 'all') {
-              const channelName = selected === 'dsg' ? 'DSG' : selected === 'sfh' ? 'SFH' : 'Direct Sales'
+              const channelName = selected === 'dsg' ? 'DSG' : selected === 'sfh' ? 'SFH' : selected === 'amazon' ? 'Amazon' : 'Direct Sales'
               const maximumCategory = Math.max(...displayBreakdown.map((item) => item.value), 1)
               const categoryTone = (label: string) => label.includes('Books') ? 'orange' : label.includes('Audio') ? 'teal' : label.includes('Pen') ? 'pink' : 'violet'
-              const cardIcon = card.id === 'zero_rated' ? '⊙' : card.id === 'exempted' ? '▧' : card.id === 'taxable' ? '%' : '▣'
-              return <article className="kpi-card channel-kpi-card" key={card.id}>
-                <div className="channel-kpi-head">
+              const cardIcon = card.id === 'zero_rated' ? '⊙' : card.id === 'exempted' ? '▧' : card.id === 'taxable' ? '▦' : '▣'
+              return <article className={`kpi-card channel-kpi-card ${isExpanded ? 'is-expanded' : ''}`} key={card.id}>
+                <button className="channel-kpi-head kpi-card-head" onClick={() => toggle(card.id)} aria-expanded={isExpanded}>
                   <span><i>{cardIcon}</i>{card.title}</span>
-                  <span className={`delta-badge comparison-badge ${comparison.direction}`}>
-                    <span className="delta-arrow">{comparison.direction === 'up' ? '↑' : comparison.direction === 'down' ? '↓' : '—'}</span>
-                    {comparison.label}
-                  </span>
-                </div>
+                  <span className={`kpi-chevron ${isExpanded ? 'open' : ''}`}>⌃</span>
+                </button>
                 <strong className="kpi-value">{number(card.total)}</strong>
                 <p>{card.subtitle}, {channelName}</p>
-                <div className="channel-category-breakdown">
+                <div className={`kpi-details ${isExpanded ? 'is-open' : ''}`}><div className="channel-category-breakdown">
                   {displayBreakdown.length ? displayBreakdown.map((item) => {
                     const tone = categoryTone(item.label)
                     return <div className="channel-category-row" key={item.label}>
@@ -1093,10 +1575,11 @@ function DashboardPage() {
                   }) : <div className="channel-empty-row">No applicable sales</div>}
                 </div>
                 <div className="channel-kpi-total"><span>Total</span><strong>{number(card.total)}</strong></div>
+                </div>
               </article>
             }
             if (isAllChannelsPnl) {
-              return <article className="kpi-card" key={card.id}>
+              return <article className={`kpi-card ${isExpanded ? 'is-expanded' : ''}`} key={card.id}>
                 <button className="kpi-card-head" onClick={() => toggle(card.id)} aria-expanded={isExpanded}>
                   <span>{card.title}</span>
                   <span className="kpi-head-actions">
@@ -1111,15 +1594,14 @@ function DashboardPage() {
                 <div className="plan-progress" role="progressbar" aria-label="Sales plan achievement" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(Math.max(achievement, 0), 100)}>
                   <span className={achievementTone} style={{ width: `${Math.min(Math.max(achievement, 0), 100)}%` }} />
                 </div>
-                {isExpanded && <div className="kpi-breakdown">
+                <div className={`kpi-details ${isExpanded ? 'is-open' : ''}`}><div className="kpi-breakdown">
                   {displayBreakdown.length ? displayBreakdown.map((item) => <div key={item.label}><span>{item.label}</span><strong>{number(item.value)}</strong></div>) : <div className="no-breakdown"><span>No applicable sales</span><strong>0</strong></div>}
-                  <div><span>Amazon</span><span className="not-integrated">Not integrated</span></div>
                   <div className="kpi-total"><span>Total</span><strong>{number(card.total)}</strong></div>
-                </div>}
+                </div></div>
               </article>
             }
-            if (isAllChannelsTaxCard) {
-              return <article className="kpi-card" key={card.id}>
+            if (isOrderCountCard) {
+              return <article className={`kpi-card ${isExpanded ? 'is-expanded' : ''}`} key={card.id}>
                 <button className="kpi-card-head" onClick={() => toggle(card.id)} aria-expanded={isExpanded}>
                   <span>{card.title}</span><span className={`kpi-chevron ${isExpanded ? 'open' : ''}`}>⌃</span>
                 </button>
@@ -1131,104 +1613,138 @@ function DashboardPage() {
                   </span>
                 </div>
                 <p>{card.subtitle}</p>
-                {isExpanded && <div className="kpi-breakdown">
-                  {displayBreakdown.length ? displayBreakdown.map((item) => <div key={item.label}><span>{item.label}</span><strong>{number(item.value)}</strong></div>) : <div className="no-breakdown"><span>No applicable sales</span><strong>0</strong></div>}
+                <div className={`kpi-details ${isExpanded ? 'is-open' : ''}`}><div className="kpi-breakdown">
+                  {displayBreakdown.map((item) => <div key={item.label}><span>{item.label}</span><strong>{number(item.value)}</strong></div>)}
                   <div className="kpi-total"><span>Total</span><strong>{number(card.total)}</strong></div>
-                </div>}
+                </div></div>
               </article>
             }
-            return <article className="kpi-card" key={card.id}>
+            if (isAllChannelsTaxCard) {
+              return <article className={`kpi-card ${isExpanded ? 'is-expanded' : ''}`} key={card.id}>
+                <button className="kpi-card-head" onClick={() => toggle(card.id)} aria-expanded={isExpanded}>
+                  <span>{card.title}</span><span className={`kpi-chevron ${isExpanded ? 'open' : ''}`}>⌃</span>
+                </button>
+                <div className="kpi-value-row">
+                  <strong className="kpi-value">{number(card.total)}</strong>
+                  <span className={`delta-badge comparison-badge ${comparison.direction}`}>
+                    <span className="delta-arrow">{comparison.direction === 'up' ? '↑' : comparison.direction === 'down' ? '↓' : '—'}</span>
+                    {comparison.label}
+                  </span>
+                </div>
+                <p>{card.subtitle}</p>
+                <div className={`kpi-details ${isExpanded ? 'is-open' : ''}`}><div className="kpi-breakdown">
+                  {displayBreakdown.length ? displayBreakdown.map((item) => <div key={item.label}><span>{item.label}</span><strong>{number(item.value)}</strong></div>) : <div className="no-breakdown"><span>No applicable sales</span><strong>0</strong></div>}
+                  <div className="kpi-total"><span>Total</span><strong>{number(card.total)}</strong></div>
+                </div></div>
+              </article>
+            }
+            return <article className={`kpi-card ${isExpanded ? 'is-expanded' : ''}`} key={card.id}>
               <button className="kpi-card-head" onClick={() => toggle(card.id)} aria-expanded={isExpanded}>
                 <span>{card.title}</span><span className={`kpi-chevron ${isExpanded ? 'open' : ''}`}>⌃</span>
               </button>
               <div className="kpi-value-row"><strong className="kpi-value">{number(card.total)}</strong>{card.trend.length >= 2 && <span className={`delta-badge ${trend.direction}`}><span className="delta-arrow">{trend.direction === 'up' ? '↑' : trend.direction === 'down' ? '↓' : ''}</span>{trend.label}</span>}</div>
               <p>{card.subtitle}</p>
               {card.trend.length >= 2 ? <Sparkline values={card.trend} direction={trend.direction} /> : <div className="trend-insufficient">Not enough data at this grain yet</div>}
-              {isExpanded && <div className="kpi-breakdown">
+              <div className={`kpi-details ${isExpanded ? 'is-open' : ''}`}><div className="kpi-breakdown">
                 {displayBreakdown.length ? displayBreakdown.map((item) => <div key={item.label}><span>{item.label}</span><strong>{number(item.value)}</strong></div>) : <div className="no-breakdown"><span>No applicable sales</span><strong>0</strong></div>}
                 <div className="kpi-total"><span>Total</span><strong>{number(card.total)}</strong></div>
-              </div>}
+              </div></div>
             </article>
           })}
         </section>
-        <SalesTrendChart trend={data.sales_trend} loading={loading} />
+        <SalesTrendChart trend={data.sales_trend} loading={loading} monthlyPlans={SALES_TREND_MONTHLY_PLANS} />
         <div className="dashboard-visual-grid">
-        <section className={`category-performance ${loading ? 'is-loading' : ''}`}>
+        <section className={`category-performance category-only-performance ${loading || categoryTableLoading ? 'is-loading' : ''}`}>
           <div className="category-performance-head">
-            <div><span className="section-kicker">Sales mix analysis</span><h3>Category Wise Performance</h3></div>
-            <button className="table-download-button" type="button" onClick={downloadCategoryPerformance}>↓ Download CSV</button>
+            <div><span className="section-kicker">Sales mix analysis</span><h3>Category Wise Performance</h3><p>{categoryChannel === 'all' ? 'All channels' : categoryChannel === 'dsg' ? 'DSG' : categoryChannel === 'sfh' ? 'SFH' : categoryChannel === 'amazon' ? 'Amazon' : 'Direct Sales'} · {periodDisplay(time, activeYear)} compared with {periodDisplay(comparison, comparisonYear)}</p></div>
+            <div className="category-performance-actions"><label><span>Channel</span><select value={categoryChannel} onChange={(event) => setCategoryChannel(event.target.value)}><option value="all">All channels</option><option value="dsg">DSG</option><option value="sfh">SFH</option><option value="amazon">Amazon</option><option value="direct">Direct Sales</option></select></label><label><span>Period</span><select value={categoryPeriodView} onChange={(event) => setCategoryPeriodView(event.target.value as typeof categoryPeriodView)}><option value="both">Both periods</option><option value="current">Current only</option><option value="comparison">Comparison only</option></select></label><label><span>Sort</span><select value={`${categorySort.key}:${categorySort.direction}`} onChange={(event) => { const [key, direction] = event.target.value.split(':'); setCategorySort({ key, direction: direction as 'asc' | 'desc' }) }}><option value="category:asc">Category A-Z</option><option value="category:desc">Category Z-A</option><option value="currentVariancePercent:asc">Worst variance first</option><option value="currentVariancePercent:desc">Best variance first</option><option value="currentActual:desc">Actual high-low</option><option value="currentActual:asc">Actual low-high</option></select></label><button className="table-download-button" type="button" onClick={downloadCategoryPerformance}>↓ Download CSV</button></div>
           </div>
+          {renderDateRangeFilter()}
+          {renderPerformanceSummary(categorySourceCurrentTotal, categoryCurrentDifference, categorySourceComparisonTotal, categoryComparisonDifference)}
           <div className="category-performance-scroll">
-            <table className="category-performance-table">
+            <table className="category-performance-table" aria-label="Category wise sales performance against plan">
+              <caption>Category wise sales performance against plan</caption>
+              <colgroup><col className="category-column" />{Array.from({ length: categoryPeriodView === 'both' ? 8 : 4 }, (_, index) => <col className="metric-column" key={index} />)}</colgroup>
               <thead>
-                <tr><th rowSpan={2}>Category</th><th colSpan={4}>Current Period</th><th colSpan={4}>Comparison Period</th></tr>
-                <tr><th>Plan</th><th>Actual</th><th>Var.</th><th>Var.%</th><th>Plan</th><th>Actual</th><th>Var.</th><th>Var.%</th></tr>
+                <tr><th rowSpan={2}><button className="sortable-heading" onClick={() => toggleCategorySort('category')}>Category {categorySort.key === 'category' ? categorySort.direction === 'asc' ? '↑' : '↓' : '↕'}</button></th>{categoryPeriodView !== 'comparison' && <th colSpan={4}>Current Period</th>}{categoryPeriodView !== 'current' && <th className="period-group-start" colSpan={4}>Comparison Period</th>}</tr>
+                <tr>{categoryPeriodView !== 'comparison' && <>{[['currentPlan','Plan'],['currentActual','Actual'],['currentVariance','Difference'],['currentVariancePercent','Diff. %']].map(([key,label]) => <th className={`${key.includes('Variance') ? 'difference-heading ' : ''}${key.endsWith('Percent') ? 'variance-percent-heading' : ''}`} key={key}><button className="sortable-heading" onClick={() => toggleCategorySort(key)}>{label} {categorySort.key === key ? categorySort.direction === 'asc' ? '↑' : '↓' : '↕'}</button></th>)}</>}{categoryPeriodView !== 'current' && <>{[['comparisonPlan','Plan'],['comparisonActual','Actual'],['comparisonVariance','Difference'],['comparisonVariancePercent','Diff. %']].map(([key,label], index) => <th className={`${index === 0 ? 'period-group-start ' : ''}${key.includes('Variance') ? 'difference-heading ' : ''}${key.endsWith('Percent') ? 'variance-percent-heading' : ''}`} key={key}><button className="sortable-heading" onClick={() => toggleCategorySort(key)}>{label} {categorySort.key === key ? categorySort.direction === 'asc' ? '↑' : '↓' : '↕'}</button></th>)}</>}</tr>
               </thead>
               <tbody>
-                {[...categoryPerformance, {
+                {[...sortedCategoryPerformance, {
                   category: 'Total',
                   current: {
-                    plan: categoryPerformance.reduce((sum, row) => sum + Math.round(row.current.plan), 0),
-                    actual: authoritativeCurrentTotal,
+                    plan: categoryCurrentPlanTotal,
+                    actual: categorySourceCurrentTotal,
                   },
                   comparison: {
-                    plan: categoryPerformance.reduce((sum, row) => sum + Math.round(row.comparison.plan), 0),
-                    actual: authoritativeComparisonTotal,
+                    plan: categoryComparisonPlanTotal,
+                    actual: categorySourceComparisonTotal,
                   },
                 }].map((row) => {
                   const currentVariance = variance(row.current.actual, row.current.plan)
                   const comparisonVariance = variance(row.comparison.actual, row.comparison.plan)
                   return <tr className={row.category === 'Total' ? 'performance-total' : ''} key={row.category}>
                     <th>{row.category}</th>
-                    <td>{number(row.current.plan)}</td><td>{number(row.current.actual)}</td>
-                    <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{currentVariance >= 0 ? '+' : ''}{number(currentVariance)}</td>
-                    <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{Math.round(variancePercent(row.current.actual, row.current.plan))}%</td>
-                    <td>{number(row.comparison.plan)}</td><td>{number(row.comparison.actual)}</td>
-                    <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{comparisonVariance >= 0 ? '+' : ''}{number(comparisonVariance)}</td>
-                    <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{Math.round(variancePercent(row.comparison.actual, row.comparison.plan))}%</td>
+                    {categoryPeriodView !== 'comparison' && <><td className="reference-value">{number(row.current.plan)}</td><td className="important-value">{number(row.current.actual)}</td>
+                    <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{currentVariance >= 0 ? '+' : '−'}{number(Math.abs(currentVariance))}</td>
+                    <td className={varianceHeatClass(variancePercent(row.current.actual, row.current.plan))}>{variancePercent(row.current.actual, row.current.plan) > 0 ? '+' : ''}{Math.round(variancePercent(row.current.actual, row.current.plan))}%</td></>}
+                    {categoryPeriodView !== 'current' && <><td className="period-group-start reference-value">{number(row.comparison.plan)}</td><td className="important-value comparison-value">{number(row.comparison.actual)}</td>
+                    <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{comparisonVariance >= 0 ? '+' : '−'}{number(Math.abs(comparisonVariance))}</td>
+                    <td className={varianceHeatClass(variancePercent(row.comparison.actual, row.comparison.plan))}>{variancePercent(row.comparison.actual, row.comparison.plan) > 0 ? '+' : ''}{Math.round(variancePercent(row.comparison.actual, row.comparison.plan))}%</td></>}
                   </tr>
                 })}
               </tbody>
             </table>
           </div>
+          <div className="variance-legend" aria-label="Variance percentage against plan legend"><span className="variance-legend-caption">Variance % against plan</span><div className="variance-legend-cluster"><b>Positive</b><div><i className="over-100" /><span>Over +100%</span></div><div><i className="above" /><span>Above plan</span></div></div><div className="variance-legend-scale">{[['miss-25', '0 to -25%'], ['miss-50', '-50%'], ['miss-75', '-75%'], ['miss-100', '-100%']].map(([tone, label]) => <div key={tone}><i className={tone} /><span>{label}</span></div>)}</div></div>
         </section>
         <section className={`category-performance channel-performance ${loading ? 'is-loading' : ''}`}>
           <div className="category-performance-head">
-            <div><span className="section-kicker">Channel analysis</span><h3>Channel Wise Performance</h3></div>
-            <button className="table-download-button" type="button" onClick={downloadChannelPerformance}>↓ Download CSV</button>
+            <div><span className="section-kicker">Channel analysis</span><h3>Channel wise performance</h3><p>{periodDisplay(time, activeYear)} compared with {periodDisplay(comparison, comparisonYear)}</p></div>
+            <div className="category-performance-actions"><label><span>Period</span><select value={channelPeriodView} onChange={(event) => setChannelPeriodView(event.target.value as typeof channelPeriodView)}><option value="both">Both periods</option><option value="current">Current only</option><option value="comparison">Comparison only</option></select></label><button className="table-download-button" type="button" onClick={downloadChannelPerformance}>↓ Download CSV</button></div>
           </div>
+          {renderDateRangeFilter()}
+          {renderPerformanceSummary(channelCurrentActualTotal, variance(channelCurrentActualTotal, channelCurrentPlanTotal), channelComparisonActualTotal, variance(channelComparisonActualTotal, channelComparisonPlanTotal))}
           <div className="category-performance-scroll">
-            <table className="category-performance-table">
+            <table className="category-performance-table" aria-label="Channel wise sales performance against plan">
+              <caption>Channel wise sales performance against plan</caption>
+              <colgroup><col className="channel-column" />{Array.from({ length: channelPeriodView === 'both' ? 8 : 4 }, (_, index) => <col className="channel-metric-column" key={index} />)}</colgroup>
               <thead>
-                <tr><th rowSpan={2}>Channel</th><th colSpan={4}>Current Period</th><th colSpan={4}>Comparison Period</th></tr>
-                <tr><th>Plan</th><th>Actual</th><th>Var.</th><th>Var.%</th><th>Plan</th><th>Actual</th><th>Var.</th><th>Var.%</th></tr>
+                <tr><th rowSpan={2}>Channel</th>{channelPeriodView !== 'comparison' && <th className="current-period-heading" colSpan={4}>Current period</th>}{channelPeriodView !== 'current' && <th className="comparison-period-heading" colSpan={4}>Comparison period</th>}</tr>
+                <tr>{channelPeriodView !== 'comparison' && <><th>Plan</th><th>Actual</th><th className="difference-heading">Difference</th><th className="difference-heading">Diff. %</th></>}{channelPeriodView !== 'current' && <><th className="period-group-start">Plan</th><th>Actual</th><th className="difference-heading">Difference</th><th className="difference-heading">Diff. %</th></>}</tr>
               </thead>
               <tbody>
-                {channelPerformance.map((row) => {
+                {channelPerformance.map((row, index) => {
                   const currentPlan = row.monthlyPlan * currentPlanMonths
                   const comparisonPlan = row.monthlyPlan * comparisonPlanMonths
                   const currentVariance = variance(row.currentActual, currentPlan)
                   const comparisonVariance = variance(row.comparisonActual, comparisonPlan)
-                  const isTotal = row.channel === 'Total Sales' || row.channel === 'Grand Total Sales'
-                  return <tr className={isTotal ? 'performance-total' : ''} key={row.channel}>
-                    <th>{row.channel}</th>
-                    <td>{number(currentPlan)}</td><td>{number(row.currentActual)}</td>
-                    <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{currentVariance >= 0 ? '+' : ''}{number(currentVariance)}</td>
-                    <td className={currentVariance >= 0 ? 'positive' : 'negative'}>{Math.round(variancePercent(row.currentActual, currentPlan))}%</td>
-                    <td>{number(comparisonPlan)}</td><td>{number(row.comparisonActual)}</td>
-                    <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{comparisonVariance >= 0 ? '+' : ''}{number(comparisonVariance)}</td>
-                    <td className={comparisonVariance >= 0 ? 'positive' : 'negative'}>{Math.round(variancePercent(row.comparisonActual, comparisonPlan))}%</td>
-                  </tr>
+                  const currentPercent = variancePercent(row.currentActual, currentPlan)
+                  const comparisonPercent = variancePercent(row.comparisonActual, comparisonPlan)
+                  const isSubtotal = row.channel === 'Total Sales'
+                  const isGrandTotal = row.channel === 'Grand Total Sales'
+                  const columnCount = channelPeriodView === 'both' ? 9 : 5
+                  return <Fragment key={row.channel}>
+                    {index === 0 && <tr className="channel-rowgroup"><th scope="rowgroup" colSpan={columnCount}>Active channels</th></tr>}
+                    <tr className={isSubtotal ? 'channel-subtotal' : isGrandTotal ? 'channel-grand-total' : ''}>
+                      <th scope="row">{isSubtotal ? <span className="subtotal-label"><b>Subtotal</b><span>Active channels</span></span> : row.channel}</th>
+                      {channelPeriodView !== 'comparison' && <><td {...channelCellProps(`${row.channel}:current-plan`, 'plan-cell')}>{number(currentPlan)}</td><td {...channelCellProps(`${row.channel}:current-actual`, 'important-value')}>{number(row.currentActual)}</td><td {...channelCellProps(`${row.channel}:current-variance`, currentVariance >= 0 ? 'positive' : 'negative')}>{currentVariance >= 0 ? '+' : '−'}{number(Math.abs(currentVariance))}</td><td {...channelCellProps(`${row.channel}:current-percent`, isSubtotal || isGrandTotal ? `${currentVariance >= 0 ? 'positive' : 'negative'} summary-percent` : channelVarianceClass(currentPercent))}>{currentPercent >= 0 ? '+' : '−'}{Math.abs(Math.round(currentPercent))}%</td></>}
+                      {channelPeriodView !== 'current' && <><td {...channelCellProps(`${row.channel}:comparison-plan`, 'plan-cell period-group-start')}>{number(comparisonPlan)}</td><td {...channelCellProps(`${row.channel}:comparison-actual`, 'comparison-actual important-value')}>{number(row.comparisonActual)}</td><td {...channelCellProps(`${row.channel}:comparison-variance`, comparisonVariance >= 0 ? 'positive' : 'negative')}>{comparisonVariance >= 0 ? '+' : '−'}{number(Math.abs(comparisonVariance))}</td><td {...channelCellProps(`${row.channel}:comparison-percent`, isSubtotal || isGrandTotal ? `${comparisonVariance >= 0 ? 'positive' : 'negative'} summary-percent` : channelVarianceClass(comparisonPercent))}>{comparisonPercent >= 0 ? '+' : '−'}{Math.abs(Math.round(comparisonPercent))}%</td></>}
+                    </tr>
+                  </Fragment>
                 })}
               </tbody>
             </table>
           </div>
+          <div className="channel-variance-legend" aria-label="Variance percentage against plan legend"><span>Variance % against plan</span><div className="legend-cluster"><b>Positive</b><div><i className="over-100" /><small>Over +100%</small></div><div><i className="above" /><small>Above plan</small></div></div><div className="legend-cluster negative-scale"><b>Negative</b>{[['miss-25','0 to -25%'],['miss-50','-50%'],['miss-75','-75%'],['miss-100','-100%']].map(([tone,label]) => <div key={tone}><i className={tone} /><small>{label}</small></div>)}</div></div>
         </section>
-        <CategoryWiseSales rows={categoryPerformance} loading={loading} />
-        {selected !== 'all' && <ProductRankings data={data.product_performance} loading={loading} />}
-        <TopProductByChannel channels={data.product_performance.channels} loading={loading} />
-        <StateWisePerformance rows={data.state_performance} loading={loading} />
-        <CustomersByEmail data={data.customer_performance} loading={loading} />
+        <CategoryWiseSales rows={categoryPerformance} loading={loading} channel={categoryChannel} onChannelChange={setCategoryChannel} dateFilter={renderDateRangeFilter()} />
+        {selected !== 'all' && <ProductRankings data={data.product_performance} loading={loading} dateFilter={renderDateRangeFilter()} />}
+        {selected !== 'all' && <>
+          <TopProductByChannel channels={data.product_performance.channels} loading={loading} />
+          <StateWisePerformance rows={data.state_performance} orderDetails={data.state_order_details ?? []} loading={loading} filters={renderStateFilters()} />
+          <CustomersByEmail data={data.customer_performance} loading={loading} period={periodDisplay(time, activeYear)} orderDetails={data.state_order_details ?? []} />
+        </>}
         </div>
       </>}
     </div>
@@ -1589,6 +2105,7 @@ function UploadHistoryPage() {
       const response = await fetch(`/api/uploads/history/${record.upload_id}`, { method: 'DELETE' })
       const result = await response.json()
       if (!response.ok) throw new Error(result.detail ?? 'Unable to delete this dataset.')
+      clearDashboardCache()
       setRecords((current) => current.filter((item) => item.upload_id !== record.upload_id))
     } catch (reason) {
       window.alert(reason instanceof Error ? reason.message : 'Unable to delete this dataset.')
@@ -1605,7 +2122,7 @@ function UploadHistoryPage() {
         {loading ? <div className="history-empty">Loading Upload History…</div> : records.length === 0 ? <div className="history-empty">No completed DSG datasets have been uploaded yet.</div> : (
           <div className="table-wrap"><table><thead><tr><th>Dataset ID</th><th>File name</th><th>Channel</th><th>Uploaded</th><th>Uploaded by</th><th>Records</th><th>Status</th><th /></tr></thead><tbody>
             {records.map((record) => <tr key={record.upload_id}>
-              <td><span className="dataset-id" title={record.upload_id}>{record.upload_id.slice(0, 8)}…</span></td><td className="history-file">{record.file_name}</td><td><span className={`channel-badge ${record.channel.toLowerCase()}`}>{record.channel}</span></td>
+              <td><span className="dataset-id" title={record.upload_id}>{record.upload_id.slice(0, 8)}…</span></td><td className="history-file">{record.file_name}</td><td><span className={`channel-badge ${record.channel.toLowerCase()}`}>{channelDisplayName(record.channel)}</span></td>
               <td>{new Date(record.uploaded_at).toLocaleString('en-IN')}</td><td>{record.uploaded_by}</td><td>{record.total_records.toLocaleString('en-IN')}</td><td><span className="status-complete">{record.upload_status}</span></td>
               <td><button className="delete-button" disabled={deleting === record.upload_id} onClick={() => remove(record)}>{deleting === record.upload_id ? 'Deleting…' : 'Delete'}</button></td>
             </tr>)}
@@ -1712,6 +2229,7 @@ function App() {
       const response = await fetch(`/api/uploads/${channelPath(selectedChannel)}/${id}/complete`, { method: 'POST' })
       const result = await response.json()
       if (!response.ok) throw new Error(result.detail ?? 'Unable to save the DSG dataset.')
+      clearDashboardCache()
       const valueFrom = (record: Record<string, unknown>, names: string[]) => {
         const entry = Object.entries(record).find(([key]) => names.includes(key.trim().toLowerCase()))
         return entry?.[1] == null ? '' : String(entry[1])
@@ -1730,7 +2248,7 @@ function App() {
       const summary = selectedChannel === 'Direct Sales'
         ? `\nProcessed: ${result.processed}\nMatched: ${result.matched}\nUnmatched: ${result.unmatched}${unmatchedDetails ? `\n\n${unmatchedDetails}` : ''}`
         : ''
-      window.alert(`${selectedChannel} dataset saved successfully.\nDataset ID: ${result.upload_id}${summary}`)
+      window.alert(`${channelDisplayName(selectedChannel)} dataset saved successfully.\nDataset ID: ${result.upload_id}${summary}`)
       setFile(null)
       setInventoryFile(null)
       setDirectUnmatched(null)
@@ -1810,10 +2328,10 @@ function App() {
             <section className="channel-grid" aria-label="Sales channels">
               {channels.map((channel) => (
                 <article
-                  className={`channel-card ${channel.name === selectedChannel ? 'selected' : !['DSG', 'SFH', 'Direct Sales'].includes(channel.name) ? 'disabled' : 'available'}`}
+                  className={`channel-card ${channel.name === selectedChannel ? 'selected' : 'available'}`}
                   key={channel.name}
                   onClick={() => {
-                    if (channel.name === 'DSG' || channel.name === 'SFH' || channel.name === 'Direct Sales') {
+                    if (channel.name === 'DSG' || channel.name === 'SFH' || channel.name === 'Amazon' || channel.name === 'Direct Sales') {
                       setSelectedChannel(channel.name)
                       setFile(null)
                       setInventoryFile(null)
@@ -1824,7 +2342,7 @@ function App() {
                   }}
                 >
                   <div className={`channel-icon ${channel.tone}`}>{channel.name.slice(0, 2).toUpperCase()}</div>
-                  <div><h3>{channel.name}</h3><span>{channel.status}</span></div>
+                  <div><h3>{channelDisplayName(channel.name)}</h3><span>{channel.status}</span></div>
                   {channel.name === selectedChannel && <div className="selected-check">✓</div>}
                 </article>
               ))}
@@ -1840,7 +2358,7 @@ function App() {
 
             <section className="upload-panel">
               <div className="panel-header">
-                <div><span className="panel-number">01</span><div><h2>Upload {selectedChannel} dataset{selectedChannel === 'Direct Sales' ? 's' : ''}</h2><p>{selectedChannel === 'Direct Sales' ? 'Upload both mandatory files before validation and mapping.' : 'Upload one complete file for validation and processing.'}</p></div></div>
+                <div><span className="panel-number">01</span><div><h2>Upload {channelDisplayName(selectedChannel)} dataset{selectedChannel === 'Direct Sales' ? 's' : ''}</h2><p>{selectedChannel === 'Direct Sales' ? 'Upload both mandatory files before validation and mapping.' : 'Upload one complete file for validation and processing.'}</p></div></div>
                 <span className="format-pill">CSV · XLSX · XLS</span>
               </div>
 
@@ -1850,7 +2368,7 @@ function App() {
                   onDrop={(event) => { event.preventDefault(); selectFile(event.dataTransfer.files[0]) }}
                   onClick={() => fileInput.current?.click()}>
                   <div className="upload-orbit"><Icon name="cloud" size={30} /></div>
-                  <h3>Drop your {selectedChannel === 'Direct Sales' ? 'Invoice Dataset' : `${selectedChannel} dataset`} here</h3>
+                  <h3>Drop your {selectedChannel === 'Direct Sales' ? 'Invoice Dataset' : `${channelDisplayName(selectedChannel)} dataset`} here</h3>
                   <p>or <button type="button">browse from your computer</button></p>
                   <span>Maximum file size: 50 MB</span>
                   <input ref={fileInput} type="file" accept=".csv,.xlsx,.xls" onChange={(event) => selectFile(event.target.files?.[0])} hidden />
@@ -1886,7 +2404,7 @@ function App() {
 
               <div className="requirements">
                 <Icon name="info" size={18} />
-                <div><strong>Before you upload</strong><p>{selectedChannel === 'DSG' ? 'Your file must include Order Number, Product Name, Category, and Item Cost × Quantity.' : selectedChannel === 'SFH' ? 'Your SFH file must include Course, Currency, Without Tax Total, and Earnings. Category will be set automatically to Web Version.' : 'Invoice requires Invoice Number, Without Tax Total, and Private Notes. Sales Inventory requires Doc No., Category, Item Details, and Qty. Only matching identifiers will be processed; unmatched records are logged.'} Existing columns and calculations will be preserved.</p></div>
+                <div><strong>Before you upload</strong><p>{selectedChannel === 'DSG' ? 'Your DSG file must include Order Number, Product Name, Category, and Item Cost × Quantity.' : selectedChannel === 'SFH' ? 'Your SFH file must include Course, Currency, Without Tax Total, and Earnings. Category will be set automatically to Web Version.' : selectedChannel === 'Amazon' ? 'Your Amazon file must include product-name, currency, item-price, and ship-state. Category will be set automatically to Books.' : 'Invoice requires Invoice Number, Without Tax Total, and Private Notes. Sales Inventory requires Doc No., Category, Item Details, and Qty. Only matching identifiers will be processed; unmatched records are logged.'} Existing columns and calculations will be preserved.</p></div>
               </div>
               <div className="panel-actions">
                 <p><span className="secure-dot" /> Your data is processed securely</p>

@@ -24,3 +24,10 @@ After deployment, verify these URLs:
 - `/api/db-test` returns `{"message":"Database Connected Successfully"}`.
 
 Do not commit a real `.env` file or database password.
+
+## Amazon channel database migration
+
+Before uploading the first Amazon dataset, apply the additive PostgreSQL
+migration in `backend/amazon_migration.sql` to the same database configured by
+`DATABASE_URL`. It creates only the Amazon row table and does not modify the
+existing DSG, SFH, Direct Sales, or upload-history tables.

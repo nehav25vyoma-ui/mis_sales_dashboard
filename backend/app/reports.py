@@ -10,24 +10,28 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from app.calculations.amounts import sfh_amount_from_record, whole_number
+from app.calculations.amounts import sfh_amount_from_record, sfh_is_inr_currency, whole_number
 from app.dashboard import (
     _direct_amount,
     _direct_sales_channel,
+    _amazon_is_cancelled,
+    _dsg_is_completed,
     _for_period,
     _load_channel_metrics,
     _month,
     _number,
+    _unique_order_count,
     _row_value,
 )
 from app.database.database import SessionLocal
-from app.database.models import DirectSalesDatasetRow, DSGDatasetRow, SFHDatasetRow, UploadHistory
+from app.database.models import AmazonDatasetRow, DirectSalesDatasetRow, DSGDatasetRow, SFHDatasetRow, UploadHistory
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
 CHANNELS = (
     ("DSG", DSGDatasetRow),
     ("SFH", SFHDatasetRow),
+    ("Amazon", AmazonDatasetRow),
     ("Direct Sales", DirectSalesDatasetRow),
 )
 REPORT_TYPES = {"summary", "channel", "category", "product"}
@@ -68,6 +72,13 @@ DIRECT_OVERVIEW_TYPES = {
 DIRECT_OVERVIEW_TYPE_ORDER = ("Bulk", "Retail", "Stall", "Language Lab")
 
 
+def _channel_display_name(channel: str) -> str:
+    return {
+        "DSG": "DSG",
+        "SFH": "SFH",
+    }.get(channel, channel)
+
+
 def _set_indian_whole_number_format(cell) -> None:
     """Keep the cell numeric while displaying Indian lakh/crore grouping."""
     if cell.data_type == "f" or not isinstance(cell.value, (int, float)):
@@ -88,6 +99,8 @@ def _matches(month_key: str, grain: str, period: str, year: int) -> bool:
     if grain == "monthly":
         selected_months = {int(value) for value in period.split(",")}
         return row_year == year and row_month in selected_months
+    if grain == "quarterly":
+        return row_year == year and ((row_month - 1) // 3) + 1 == int(period)
     return row_year == year
 
 
@@ -113,6 +126,10 @@ def _filtered_rows(database, grain: str, period: str, year: int):
     result = []
     for channel, model in CHANNELS:
         for row in database.query(model).all():
+            if channel == "DSG" and not _dsg_is_completed(row):
+                continue
+            if channel == "Amazon" and _amazon_is_cancelled(row):
+                continue
             month_key = _month(row.row_data, upload_dates.get(row.upload_id, fallback))
             if _matches(month_key, grain, period, year):
                 result.append((channel, row, month_key))
@@ -144,7 +161,7 @@ def _quantity(channel: str, row) -> float:
         return _number(value)
     # SFH exports are transaction-level: one row is one purchased course.
     # Current SFH source files have Course/Description but no Quantity field.
-    if channel == "SFH" and (row.product_name or getattr(row, "course", None)):
+    if channel in {"SFH", "Amazon"} and (row.product_name or getattr(row, "course", None)):
         return 1.0
     return 0.0
 
@@ -352,21 +369,35 @@ def _reconciled_whole_numbers(values: list[float], target: int | None = None) ->
     return displayed
 
 
-def _append_channel_sheet(workbook: Workbook, name: str, rows, label: str) -> None:
-    sheet = workbook.create_sheet(name)
+def _report_year_month(month_key: str) -> tuple[int | str, str]:
+    try:
+        year, month = (int(value) for value in month_key.split("-"))
+        return year, datetime(year, month, 1).strftime("%B")
+    except (AttributeError, TypeError, ValueError):
+        return "", ""
+
+
+def _append_channel_sheet(
+    workbook: Workbook, name: str, rows, label: str, *, include_period: bool = False
+) -> None:
+    sheet = workbook.create_sheet(_channel_display_name(name))
     sheet.append([label])
-    sheet.append(["Sl.No", "Type", "ID", "Description", "Quantity", "Total", "Location"])
+    sheet.append(
+        ["Sl.No", "Year", "Month", "Type", "ID", "Description", "Quantity", "Total", "Location"]
+        if include_period else
+        ["Sl.No", "Type", "ID", "Description", "Quantity", "Total", "Location"]
+    )
     display_quantities = _reconciled_whole_numbers(
         [_quantity(name, row) for _, row, _ in rows]
     )
     display_amounts = _reconciled_whole_numbers(
         [_amount(name, row) for _, row, _ in rows]
     )
-    for index, ((_, row, _), quantity, amount) in enumerate(
+    for index, ((_, row, month_key), quantity, amount) in enumerate(
         zip(rows, display_quantities, display_amounts), 1
     ):
         data = row.row_data
-        sheet.append([
+        values = [
             index,
             row.category or _row_value(data, ("type", "sales type")) or "",
             getattr(row, "order_number", None) or _row_value(data, ("id", "order id", "invoice number")) or "",
@@ -374,19 +405,31 @@ def _append_channel_sheet(workbook: Workbook, name: str, rows, label: str) -> No
             quantity,
             amount,
             _location(name, data) or "NA",
-        ])
+        ]
+        if include_period:
+            year, month = _report_year_month(month_key)
+            values[1:1] = [year, month]
+        sheet.append(values)
     first_data_row = 3
     last_data_row = sheet.max_row
     has_data = last_data_row >= first_data_row
-    sheet.append([
-        "", "Grand Total", "", "",
-        f"=SUBTOTAL(109,E{first_data_row}:E{last_data_row})" if has_data else 0,
-        f"=SUBTOTAL(109,F{first_data_row}:F{last_data_row})" if has_data else 0,
-        "",
-    ])
+    if include_period:
+        sheet.append([
+            "", "", "", "Grand Total", "", "",
+            f"=SUBTOTAL(109,G{first_data_row}:G{last_data_row})" if has_data else 0,
+            f"=SUBTOTAL(109,H{first_data_row}:H{last_data_row})" if has_data else 0,
+            "",
+        ])
+    else:
+        sheet.append([
+            "", "Grand Total", "", "",
+            f"=SUBTOTAL(109,E{first_data_row}:E{last_data_row})" if has_data else 0,
+            f"=SUBTOTAL(109,F{first_data_row}:F{last_data_row})" if has_data else 0,
+            "",
+        ])
     _style_sheet(sheet, label)
-    sheet.auto_filter.ref = f"A2:G{last_data_row if has_data else 2}"
-    for column in ("E", "F"):
+    sheet.auto_filter.ref = f"A2:{'I' if include_period else 'G'}{last_data_row if has_data else 2}"
+    for column in (("G", "H") if include_period else ("E", "F")):
         for cell in sheet[column][2:]:
             _set_indian_whole_number_format(cell)
     for cell in sheet[sheet.max_row]:
@@ -395,66 +438,368 @@ def _append_channel_sheet(workbook: Workbook, name: str, rows, label: str) -> No
         cell.border = Border(bottom=Side(style="thin", color="1F2937"))
 
 
+def _append_dsg_summary_sheet(workbook: Workbook, rows, label: str) -> None:
+    """Build the Summary Report DSG detail sheet using order-level charges once."""
+    sheet = workbook.create_sheet("DSG")
+    sheet.append([label])
+    sheet.append([
+        "SL No", "Year", "Month", "Order ID", "Type", "Description", "Quantity",
+        "Basic Value", "Shipping", "Discount", "Taxable Value",
+        "Total Tax", "Total Invoice Value",
+    ])
+    completed_rows = [item for item in rows if _dsg_is_completed(item[1])]
+    charged_orders: set[str] = set()
+    for index, (_, row, month_key) in enumerate(completed_rows, 1):
+        data = row.row_data
+        year, month = _report_year_month(month_key)
+        order_id = str(
+            getattr(row, "order_number", None)
+            or _row_value(data, ("order number",))
+            or ""
+        ).strip()
+        order_key = order_id.casefold()
+        first_order_row = order_key not in charged_orders
+        if first_order_row:
+            charged_orders.add(order_key)
+        basic_value = _number(
+            _row_value(data, ("item cost × quantity", "item cost x quantity"))
+            if _row_value(data, ("item cost × quantity", "item cost x quantity")) is not None
+            else row.amount
+        )
+        shipping = _number(_row_value(data, ("order shipping amount",))) if first_order_row else 0.0
+        discount = _number(_row_value(data, ("cart discount amount",)))
+        total_tax = _number(_row_value(data, ("order total tax amount",))) if first_order_row else 0.0
+        taxable_value = basic_value + shipping + discount
+        sheet.append([
+            index,
+            year,
+            month,
+            order_id,
+            row.category or _row_value(data, ("category",)) or "",
+            row.product_name or _row_value(data, ("product name",)) or "",
+            _quantity("DSG", row),
+            basic_value,
+            shipping,
+            discount,
+            taxable_value,
+            total_tax,
+            taxable_value + total_tax,
+        ])
+    first_data_row = 3
+    last_data_row = sheet.max_row
+    has_data = last_data_row >= first_data_row
+    sheet.append([
+        "", "", "", "Grand Total", "", "",
+        f"=SUBTOTAL(109,G{first_data_row}:G{last_data_row})" if has_data else 0,
+        *(
+            [f"=SUBTOTAL(109,{column}{first_data_row}:{column}{last_data_row})" for column in "HIJKLM"]
+            if has_data else [0] * 6
+        ),
+    ])
+    _style_sheet(sheet, label)
+    sheet.auto_filter.ref = f"A2:M{last_data_row if has_data else 2}"
+    for column in "GHIJKLM":
+        for cell in sheet[column][2:]:
+            _set_indian_whole_number_format(cell)
+    for cell in sheet[sheet.max_row]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="E8EAF6")
+        cell.border = Border(bottom=Side(style="thin", color="1F2937"))
+
+
+def _append_sfh_summary_sheet(workbook: Workbook, rows, label: str) -> None:
+    """Build one Summary Report detail row per unique SFH Invoice No."""
+    sheet = workbook.create_sheet("SFH")
+    sheet.append([label])
+    sheet.append([
+        "SL No", "Year", "Month", "Order ID", "Type", "Description", "Quantity",
+        "Basic Value", "Shipping", "Discount", "Taxable Value",
+        "Total Tax", "Total Invoice Value",
+    ])
+    seen_invoices: set[str] = set()
+    output_rows = []
+    for _, row, month_key in rows:
+        data = row.row_data
+        year, month = _report_year_month(month_key)
+        invoice = str(
+            _row_value(data, ("invoice no.", "invoice no", "invoice number")) or ""
+        ).strip()
+        invoice_key = invoice.casefold()
+        if invoice_key in seen_invoices:
+            continue
+        seen_invoices.add(invoice_key)
+        currency = _row_value(data, ("currency",))
+        # SFH business rule: only the rupee symbol is INR. Text such as
+        # "INR", and every other value, is treated as Non-INR.
+        is_inr = sfh_is_inr_currency(currency)
+        basic_value = _number(_row_value(
+            data,
+            ("without tax total",) if is_inr else ("earnings",),
+        ))
+        total_tax = _number(_row_value(data, ("tax",))) if is_inr else 0.0
+        taxable_value = basic_value  # SFH has neither shipping nor discount.
+        output_rows.append([
+            len(output_rows) + 1,
+            year,
+            month,
+            invoice,
+            "Web Version",
+            row.course or row.product_name or _row_value(data, ("course",)) or "",
+            1,
+            basic_value,
+            0,
+            0,
+            taxable_value,
+            total_tax,
+            taxable_value + total_tax,
+        ])
+    for output_row in output_rows:
+        sheet.append(output_row)
+    first_data_row = 3
+    last_data_row = sheet.max_row
+    has_data = last_data_row >= first_data_row
+    sheet.append([
+        "", "", "", "Grand Total", "", "",
+        f"=SUBTOTAL(109,G{first_data_row}:G{last_data_row})" if has_data else 0,
+        *(
+            [f"=SUBTOTAL(109,{column}{first_data_row}:{column}{last_data_row})" for column in "HIJKLM"]
+            if has_data else [0] * 6
+        ),
+    ])
+    _style_sheet(sheet, label)
+    sheet.auto_filter.ref = f"A2:M{last_data_row if has_data else 2}"
+    for column in "GHIJKLM":
+        for cell in sheet[column][2:]:
+            _set_indian_whole_number_format(cell)
+    for cell in sheet[sheet.max_row]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="E8EAF6")
+        cell.border = Border(bottom=Side(style="thin", color="1F2937"))
+
+
+def _append_amazon_summary_sheet(workbook: Workbook, rows, label: str) -> None:
+    """Build the Summary Report Amazon detail sheet without tax or discount."""
+    sheet = workbook.create_sheet("Amazon")
+    sheet.append([label])
+    sheet.append([
+        "SL No", "Year", "Month", "Order ID", "Type", "Description", "Quantity",
+        "Basic Value", "Shipping", "Discount", "Taxable Value",
+        "Total Tax", "Total Invoice Value",
+    ])
+    valid_rows = [item for item in rows if not _amazon_is_cancelled(item[1])]
+    for index, (_, row, month_key) in enumerate(valid_rows, 1):
+        data = row.row_data
+        year, month = _report_year_month(month_key)
+        basic_value = _number(_row_value(data, ("item-price", "item price")))
+        shipping = _number(_row_value(data, ("shipping-price", "shipping price")))
+        taxable_value = basic_value + shipping
+        sheet.append([
+            index,
+            year,
+            month,
+            _row_value(data, ("amazon-order-id", "amazon order id")) or "",
+            "Books",
+            _row_value(data, ("product-name", "product name")) or row.product_name or "",
+            _number(_row_value(data, ("quantity",))),
+            basic_value,
+            shipping,
+            0,
+            taxable_value,
+            0,
+            taxable_value,
+        ])
+    first_data_row = 3
+    last_data_row = sheet.max_row
+    has_data = last_data_row >= first_data_row
+    sheet.append([
+        "", "", "", "Grand Total", "", "",
+        f"=SUBTOTAL(109,G{first_data_row}:G{last_data_row})" if has_data else 0,
+        *(
+            [f"=SUBTOTAL(109,{column}{first_data_row}:{column}{last_data_row})" for column in "HIJKLM"]
+            if has_data else [0] * 6
+        ),
+    ])
+    _style_sheet(sheet, label)
+    sheet.auto_filter.ref = f"A2:M{last_data_row if has_data else 2}"
+    for column in "GHIJKLM":
+        for cell in sheet[column][2:]:
+            _set_indian_whole_number_format(cell)
+    for cell in sheet[sheet.max_row]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="E8EAF6")
+        cell.border = Border(bottom=Side(style="thin", color="1F2937"))
+
+
+def _append_direct_sales_summary_sheet(workbook: Workbook, rows, label: str) -> None:
+    """Build Direct Sales details from matched rows with invoice totals allocated once."""
+    sheet = workbook.create_sheet("Direct Sales")
+    sheet.append([label])
+    sheet.append([
+        "SL No", "Year", "Month", "Order ID", "Type", "Description", "Quantity",
+        "Taxable Value", "Total Tax", "Total Invoice Value",
+    ])
+
+    invoice_totals: dict[str, float] = defaultdict(float)
+    for _, row, _ in rows:
+        data = row.row_data
+        invoice_key = _order_identifier("Direct Sales", row)
+        invoice_totals[invoice_key] += _number(
+            _row_value(data, ("without tax total",))
+            if _row_value(data, ("without tax total",)) is not None
+            else getattr(row, "amount", None)
+        )
+
+    for index, (_, row, month_key) in enumerate(rows, 1):
+        data = row.row_data
+        year, month = _report_year_month(month_key)
+        invoice_id = str(
+            getattr(row, "order_number", None)
+            or _row_value(data, ("invoice number",))
+            or ""
+        ).strip()
+        invoice_key = invoice_id.casefold()
+        # Upload processing allocates Without Tax Total over matched inventory
+        # lines. Keep that allocation in the report so filtering a line does
+        # not hide the entire invoice value. Allocate invoice tax by the same
+        # ratio; the complete invoice still adds back exactly once.
+        taxable_value = _number(
+            _row_value(data, ("without tax total",))
+            if _row_value(data, ("without tax total",)) is not None
+            else getattr(row, "amount", None)
+        )
+        invoice_taxable = invoice_totals.get(invoice_key, 0.0)
+        invoice_tax = _number(_row_value(data, ("tax",)))
+        total_tax = (
+            invoice_tax * taxable_value / invoice_taxable
+            if invoice_taxable else 0.0
+        )
+        sheet.append([
+            index,
+            year,
+            month,
+            invoice_id,
+            row.category or _row_value(data, ("category",)) or "",
+            row.product_name or _row_value(data, ("item details",)) or "",
+            _number(_row_value(data, ("category quantity", "qty", "quantity"))),
+            taxable_value,
+            total_tax,
+            taxable_value + total_tax,
+        ])
+
+    first_data_row = 3
+    last_data_row = sheet.max_row
+    has_data = last_data_row >= first_data_row
+    sheet.append([
+        "", "", "", "Grand Total", "", "",
+        f"=SUBTOTAL(109,G{first_data_row}:G{last_data_row})" if has_data else 0,
+        *(
+            [f"=SUBTOTAL(109,{column}{first_data_row}:{column}{last_data_row})" for column in "HIJ"]
+            if has_data else [0] * 3
+        ),
+    ])
+    _style_sheet(sheet, label)
+    sheet.auto_filter.ref = f"A2:J{last_data_row if has_data else 2}"
+    for column in "GHIJ":
+        for cell in sheet[column][2:]:
+            _set_indian_whole_number_format(cell)
+    for cell in sheet[sheet.max_row]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="E8EAF6")
+        cell.border = Border(bottom=Side(style="thin", color="1F2937"))
+
+
+def _summary_gst(channel: str, rows) -> float:
+    """Return GST using the same uniqueness/currency rules as detail sheets."""
+    if channel == "Amazon":
+        return 0.0
+    seen_orders: set[str] = set()
+    total = 0.0
+    for _, row, _ in rows:
+        data = row.row_data
+        order_id = _order_identifier(channel, row)
+        if order_id in seen_orders:
+            continue
+        seen_orders.add(order_id)
+        if channel == "SFH":
+            currency = _row_value(data, ("currency",))
+            if not sfh_is_inr_currency(currency):
+                continue
+        total += _number(_row_value(data, ("order total tax amount", "tax")))
+    return total
+
+
 def _summary_workbook(rows, grain: str, period: str, year: int) -> Workbook:
     workbook = Workbook()
     workbook.remove(workbook.active)
     label = _period_label(grain, period, year)
     metrics = _load_channel_metrics()
     summary = workbook.create_sheet("Summary")
-    summary.append([f"{label} Sales"])
+    summary.append([f"{label} Sales and Out put GST -Summary"])
     summary.append([
         "Sl.no",
         "Particulars",
-        "0 Rated Sales",
-        "Exempted Sales",
-        "Taxable Amount",
-        "Sales As per P&L",
+        "Orders",
+        "Foreign Sales",
+        "Books Sales",
+        "Taxable Sales",
+        "Total Sales",
+        "GST Only On Taxable",
         "Total Invoice Amount",
+        "Remarks",
     ])
     channel_definitions = (
-        ("DSG", "dsg", "Online Sales"),
-        ("SFH", "sfh", "Website Sales"),
+        ("DSG", "dsg", "DSG"),
+        ("SFH", "sfh", "SFH"),
         ("Direct Sales", "direct", "Direct Sales"),
+        ("Amazon", "amazon", "Amazon Sales"),
     )
     raw_rows = []
-    for index, (channel_name, metric_key, display_name) in enumerate(channel_definitions, 1):
+    for channel_name, metric_key, display_name in channel_definitions:
+        channel_rows = [item for item in rows if item[0] == channel_name]
+        if not channel_rows:
+            continue
         values = _for_period(metrics.get(metric_key, {}), grain, period, year) if metric_key in metrics else defaultdict(float)
         amounts = [
+            _unique_order_count(channel_rows),
             values["zero_rated"],
             values["exempted"],
             values["taxable"],
             values["pnl"],
-            values["pnl"],
+            _summary_gst(channel_name, channel_rows),
         ]
-        raw_rows.append((index, display_name, amounts))
-    # Reconcile the three mutually exclusive sales buckets first. P&L and
-    # invoice totals must then be derived from those displayed bucket values so
-    # every visible row adds up exactly after whole-rupee rounding.
+        raw_rows.append((len(raw_rows) + 1, display_name, amounts))
+    # Reconcile each visible sales bucket, but round P&L from the combined raw
+    # channel amount. This matches the detail-sheet grand total when fractional
+    # values across multiple buckets combine to an additional rupee.
     reconciled_buckets = [
         _reconciled_whole_numbers([amounts[column] for _, _, amounts in raw_rows])
-        for column in range(3)
+        for column in range(1, 4)
     ]
     displayed_rows = [
         [
+            raw_rows[row][2][0],
             *(reconciled_buckets[column][row] for column in range(3)),
-            sum(reconciled_buckets[column][row] for column in range(3)),
-            sum(reconciled_buckets[column][row] for column in range(3)),
+            whole_number(raw_rows[row][2][4]),
+            whole_number(raw_rows[row][2][5]),
+            whole_number(raw_rows[row][2][4]) + whole_number(raw_rows[row][2][5]),
+            "",
         ]
         for row in range(len(raw_rows))
     ]
     for (index, display_name, _), display_amounts in zip(raw_rows, displayed_rows):
         summary.append([index, display_name, *display_amounts])
     bucket_totals = [sum(column) for column in reconciled_buckets]
-    sales_total = sum(bucket_totals)
-    total_values = [*bucket_totals, sales_total, sales_total]
+    sales_total = sum(row[4] for row in displayed_rows)
+    gst_total = sum(row[5] for row in displayed_rows)
+    total_values = [sum(row[0] for row in displayed_rows), *bucket_totals, sales_total, gst_total, sales_total + gst_total, "-"]
     summary.append(["", "Total Sales", *total_values])
-    _style_sheet(summary, f"{label} Sales")
+    _style_sheet(summary, f"{label} Sales and Out put GST -Summary")
     thin = Side(style="thin", color="1F2937")
-    for row in summary.iter_rows(min_row=2, max_row=summary.max_row, min_col=1, max_col=7):
+    for row in summary.iter_rows(min_row=2, max_row=summary.max_row, min_col=1, max_col=10):
         for cell in row:
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
             cell.alignment = Alignment(vertical="center", wrap_text=True)
-            if cell.column >= 3 and cell.row >= 3:
+            if 3 <= cell.column <= 9 and cell.row >= 3:
                 _set_indian_whole_number_format(cell)
     for cell in summary[summary.max_row]:
         cell.font = Font(bold=True)
@@ -462,8 +807,18 @@ def _summary_workbook(rows, grain: str, period: str, year: int) -> Workbook:
     summary.row_dimensions[2].height = 34
     for channel, _ in CHANNELS:
         channel_rows = [item for item in rows if item[0] == channel]
-        channel_title = f"{label} {channel}" if channel == "Direct Sales" else f"{label} {channel} Sales"
-        _append_channel_sheet(workbook, channel, channel_rows, channel_title)
+        display_channel = channel
+        channel_title = f"{label} {display_channel}" if channel == "Direct Sales" else f"{label} {display_channel} Sales"
+        if channel == "DSG":
+            _append_dsg_summary_sheet(workbook, channel_rows, channel_title)
+        elif channel == "SFH":
+            _append_sfh_summary_sheet(workbook, channel_rows, channel_title)
+        elif channel == "Amazon":
+            _append_amazon_summary_sheet(workbook, channel_rows, channel_title)
+        elif channel == "Direct Sales":
+            _append_direct_sales_summary_sheet(workbook, channel_rows, channel_title)
+        else:
+            _append_channel_sheet(workbook, channel, channel_rows, channel_title)
     return workbook
 
 
@@ -483,7 +838,7 @@ def _performance_workbook(rows, report_type: str, grain: str, period: str, year:
     group_index = {"channel": 0, "category": 1, "product": 2}[report_type]
     totals = defaultdict(lambda: [0.0, 0.0])
     for channel, row, _ in rows:
-        keys = (channel, row.category or "Uncategorised", row.product_name or getattr(row, "course", None) or "Unmapped")
+        keys = (_channel_display_name(channel), row.category or "Uncategorised", row.product_name or getattr(row, "course", None) or "Unmapped")
         quantity = _quantity(channel, row)
         totals[keys[group_index]][0] += quantity
         totals[keys[group_index]][1] += _amount(channel, row)
@@ -748,7 +1103,8 @@ def _clean_workbook(rows, grain: str, period: str, year: int) -> Workbook:
     label = _period_label(grain, period, year)
     for channel, _ in CHANNELS:
         channel_rows = [item for item in rows if item[0] == channel]
-        channel_title = f"{label} {channel}" if channel == "Direct Sales" else f"{label} {channel} Sales"
+        display_channel = _channel_display_name(channel)
+        channel_title = f"{label} {display_channel}" if channel == "Direct Sales" else f"{label} {display_channel} Sales"
         _append_channel_sheet(workbook, channel, channel_rows, channel_title)
     workbook.properties.title = f"{label} cleaned sales dataset"
     return workbook

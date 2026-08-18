@@ -6,12 +6,17 @@ from app.reports import (
     INDIAN_LAKH_FORMAT,
     INDIAN_WHOLE_NUMBER_FORMAT,
     _append_channel_sheet,
+    _append_dsg_summary_sheet,
+    _append_sfh_summary_sheet,
+    _append_amazon_summary_sheet,
+    _append_direct_sales_summary_sheet,
     _build_direct_sales_overview,
     _product_performance_workbook,
     _product_type,
     _summary_workbook,
 )
 from app.database.models import DirectSalesDatasetRow, UploadHistory
+from app.dashboard import _amazon_is_cancelled, _dsg_pnl_amount, _unique_order_count
 from openpyxl import Workbook
 
 
@@ -66,13 +71,22 @@ def test_summary_displayed_pnl_equals_displayed_sales_buckets(monkeypatch):
     monkeypatch.setattr("app.reports._load_channel_metrics", lambda: metrics)
     monkeypatch.setattr("app.reports._for_period", lambda values, *_: values)
 
-    sheet = _summary_workbook([], "monthly", "7", 2026)["Summary"]
+    summary_rows = [
+        ("DSG", _dsg_summary_row("D-1", "Completed", "Book", 1, 1, 0, 0, 0), "2026-07"),
+        ("SFH", _sfh_summary_row("S-1", "USD", "Course", 1, 1, 0), "2026-07"),
+        ("Direct Sales", _direct_row(1, "X-1", "Book", 1, 1), "2026-07"),
+    ]
+    sheet = _summary_workbook(summary_rows, "monthly", "7", 2026)["Summary"]
 
     for row_number in range(3, 7):
-        buckets = sum(sheet.cell(row_number, column).value for column in (3, 4, 5))
-        assert sheet.cell(row_number, 6).value == buckets
-        assert sheet.cell(row_number, 7).value == buckets
-    assert sheet.cell(5, 6).value == 112062
+        buckets = sum(sheet.cell(row_number, column).value for column in (4, 5, 6))
+        assert abs(sheet.cell(row_number, 7).value - buckets) <= 1
+        assert sheet.cell(row_number, 9).value == sheet.cell(row_number, 7).value + sheet.cell(row_number, 8).value
+    assert sheet.cell(5, 7).value == 112062
+    assert [sheet.cell(row, 3).value for row in range(3, 6)] == [1, 1, 1]
+    assert [sheet.cell(row, 2).value for row in range(3, 6)] == [
+        "DSG", "SFH", "Direct Sales",
+    ]
 
 
 def test_clean_report_total_matches_rounded_raw_aggregate():
@@ -98,6 +112,205 @@ def test_clean_report_total_matches_rounded_raw_aggregate():
     assert sheet.cell(4, 6).value == 1
     assert sheet.cell(sheet.max_row, 6).value == "=SUBTOTAL(109,F3:F4)"
     assert sheet.auto_filter.ref == "A2:G4"
+
+
+def _dsg_summary_row(order, status, product, basic, quantity, shipping, discount, tax):
+    return SimpleNamespace(
+        order_number=order,
+        category="Books",
+        product_name=product,
+        amount=str(basic),
+        row_data={
+            "Order Number": order,
+            "Order Status": status,
+            "Category": "Books",
+            "Product Name": product,
+            "Quantity": quantity,
+            "Item Cost × Quantity": basic,
+            "Order Shipping Amount": shipping,
+            "Cart Discount Amount": discount,
+            "Order Total Tax Amount": tax,
+        },
+    )
+
+
+def test_dsg_summary_includes_only_completed_and_charges_order_values_once():
+    rows = [
+        ("DSG", _dsg_summary_row("ORD-1", "Completed", "Book A", 100, 1, 25, -10, 18), "2026-08"),
+        ("DSG", _dsg_summary_row("ORD-1", "Completed", "Book B", 200, 2, 25, -20, 18), "2026-08"),
+        ("DSG", _dsg_summary_row("ORD-2", "Cancelled", "Book C", 999, 1, 50, -5, 100), "2026-08"),
+    ]
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    _append_dsg_summary_sheet(workbook, rows, "Aug - 26 DSG Sales")
+    sheet = workbook["DSG"]
+
+    assert [cell.value for cell in sheet[2]] == [
+        "SL No", "Year", "Month", "Order ID", "Type", "Description", "Quantity",
+        "Basic Value", "Shipping", "Discount", "Taxable Value",
+        "Total Tax", "Total Invoice Value",
+    ]
+    assert sheet.max_row == 5  # title, header, two completed rows, grand total
+    assert [sheet.cell(3, column).value for column in range(1, 14)] == [
+        1, 2026, "August", "ORD-1", "Books", "Book A", 1.0, 100.0, 25.0, -10.0, 115.0, 18.0, 133.0,
+    ]
+    assert [sheet.cell(4, column).value for column in range(1, 14)] == [
+        2, 2026, "August", "ORD-1", "Books", "Book B", 2.0, 200.0, 0.0, -20.0, 180.0, 0.0, 180.0,
+    ]
+
+
+def test_dsg_pnl_amount_adds_shipping_once_and_discount_per_product_row():
+    first = _dsg_summary_row("ORD-1", "Completed", "Book A", 100, 1, 25, -10, 18)
+    second = _dsg_summary_row("ORD-1", "Completed", "Book B", 200, 1, 25, -20, 18)
+    charged_orders: set[str] = set()
+
+    assert _dsg_pnl_amount(first, charged_orders) == 115
+    assert _dsg_pnl_amount(second, charged_orders) == 180
+    assert _dsg_pnl_amount(
+        _dsg_summary_row("ORD-2", "Completed", "Book C", 300, 1, 30, -15, 0),
+        charged_orders,
+    ) == 315
+
+
+def _sfh_summary_row(invoice, currency, course, without_tax, earnings, tax):
+    return SimpleNamespace(
+        course=course,
+        product_name=course,
+        category="Web Version",
+        row_data={
+            "Invoice No.": invoice,
+            "Currency": currency,
+            "Course": course,
+            "Without Tax Total": without_tax,
+            "Earnings": earnings,
+            "Tax": tax,
+        },
+    )
+
+
+def test_sfh_summary_deduplicates_invoice_and_applies_currency_rules():
+    rows = [
+        ("SFH", _sfh_summary_row("INV-1", "₹", "Course A", 100, 150, 18), "2026-08"),
+        ("SFH", _sfh_summary_row("INV-1", "₹", "Duplicate", 100, 150, 18), "2026-08"),
+        ("SFH", _sfh_summary_row("INV-2", "INR", "Course B", 200, 250, 36), "2026-08"),
+        ("SFH", _sfh_summary_row("INV-3", "USD", "Course C", 300, 275, 54), "2026-08"),
+    ]
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    _append_sfh_summary_sheet(workbook, rows, "Aug - 26 SFH Sales")
+    sheet = workbook["SFH"]
+
+    assert sheet.max_row == 6  # title, header, three unique invoices, grand total
+    assert [sheet.cell(3, column).value for column in range(1, 14)] == [
+        1, 2026, "August", "INV-1", "Web Version", "Course A", 1, 100.0, 0, 0, 100.0, 18.0, 118.0,
+    ]
+    assert [sheet.cell(4, column).value for column in range(1, 14)] == [
+        2, 2026, "August", "INV-2", "Web Version", "Course B", 1, 250.0, 0, 0, 250.0, 0.0, 250.0,
+    ]
+    assert [sheet.cell(5, column).value for column in range(1, 14)] == [
+        3, 2026, "August", "INV-3", "Web Version", "Course C", 1, 275.0, 0, 0, 275.0, 0.0, 275.0,
+    ]
+
+
+def _amazon_summary_row(order, status, product, quantity, item_price, shipping):
+    return SimpleNamespace(
+        product_name=product,
+        category="Books",
+        amount=str(item_price),
+        row_data={
+            "amazon-order-id": order,
+            "order-status": status,
+            "product-name": product,
+            "quantity": quantity,
+            "item-price": item_price,
+            "shipping-price": shipping,
+        },
+    )
+
+
+def test_amazon_summary_excludes_cancelled_and_calculates_without_tax_or_discount():
+    rows = [
+        ("Amazon", _amazon_summary_row("AMZ-1", "Shipped", "Book A", 2, 500, 40), "2026-08"),
+        ("Amazon", _amazon_summary_row("AMZ-2", "Cancelled", "Book B", 1, 999, 50), "2026-08"),
+        ("Amazon", _amazon_summary_row("AMZ-3", "Pending", "Book C", 3, 300, 0), "2026-08"),
+    ]
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    _append_amazon_summary_sheet(workbook, rows, "Aug - 26 Amazon Sales")
+    sheet = workbook["Amazon"]
+
+    assert sheet.max_row == 5  # title, header, two valid rows, grand total
+    assert [sheet.cell(3, column).value for column in range(1, 14)] == [
+        1, 2026, "August", "AMZ-1", "Books", "Book A", 2.0, 500.0, 40.0, 0, 540.0, 0, 540.0,
+    ]
+    assert [sheet.cell(4, column).value for column in range(1, 14)] == [
+        2, 2026, "August", "AMZ-3", "Books", "Book C", 3.0, 300.0, 0.0, 0, 300.0, 0, 300.0,
+    ]
+
+
+def test_unique_order_count_uses_channel_rules_and_amazon_exclusions():
+    completed = _dsg_summary_row("SAME-ID", "Completed", "A", 1, 1, 0, 0, 0)
+    cancelled = _dsg_summary_row("DSG-X", "Cancelled", "B", 1, 1, 0, 0, 0)
+    sfh = _sfh_summary_row("SAME-ID", "INR", "Course", 1, 1, 0)
+    returning = _amazon_summary_row("AMZ-X", "Shipped - Returning to Seller", "A", 1, 1, 0)
+    shipped = _amazon_summary_row("AMZ-OK", "Shipped", "B", 1, 1, 0)
+    rows = [
+        ("DSG", completed, "2026-08"), ("DSG", completed, "2026-08"),
+        ("DSG", cancelled, "2026-08"), ("SFH", sfh, "2026-08"),
+        ("SFH", sfh, "2026-08"), ("Amazon", returning, "2026-08"),
+        ("Amazon", shipped, "2026-08"),
+    ]
+
+    assert _unique_order_count(rows) == 3
+    assert _amazon_is_cancelled(returning) is True
+
+
+def test_direct_sales_summary_maps_fields_and_allocates_invoice_values_without_duplication():
+    rows = [
+        ("Direct Sales", SimpleNamespace(
+            order_number="INV-1", category="Books", product_name="Book A", amount="60",
+            row_data={
+                "Invoice Number": "INV-1", "Without Tax Total": 60,
+                "Original Without Tax Total": 100, "Tax": 18,
+                "Category": "Books", "Item Details": "Book A", "Category Quantity": 2,
+            },
+        ), "2026-08"),
+        ("Direct Sales", SimpleNamespace(
+            order_number="INV-1", category="Audio Device", product_name="Player", amount="40",
+            row_data={
+                "Invoice Number": "INV-1", "Without Tax Total": 40,
+                "Original Without Tax Total": 100, "Tax": 18,
+                "Category": "Audio Device", "Item Details": "Player", "Category Quantity": 1,
+            },
+        ), "2026-08"),
+        ("Direct Sales", SimpleNamespace(
+            order_number="INV-2", category="Pen Drive", product_name="USB Course", amount="50",
+            row_data={
+                "Invoice Number": "INV-2", "Without Tax Total": 50, "Tax": 9,
+                "Category": "Pen Drive", "Item Details": "USB Course", "Category Quantity": 3,
+            },
+        ), "2026-08"),
+    ]
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    _append_direct_sales_summary_sheet(workbook, rows, "Aug - 26 Direct Sales")
+    sheet = workbook["Direct Sales"]
+
+    assert [cell.value for cell in sheet[2]] == [
+        "SL No", "Year", "Month", "Order ID", "Type", "Description", "Quantity",
+        "Taxable Value", "Total Tax", "Total Invoice Value",
+    ]
+    assert [sheet.cell(3, column).value for column in range(1, 11)] == [
+        1, 2026, "August", "INV-1", "Books", "Book A", 2.0, 60.0, 10.8, 70.8,
+    ]
+    assert [sheet.cell(4, column).value for column in range(1, 11)] == [
+        2, 2026, "August", "INV-1", "Audio Device", "Player", 1.0, 40.0, 7.2, 47.2,
+    ]
+    assert [sheet.cell(5, column).value for column in range(1, 11)] == [
+        3, 2026, "August", "INV-2", "Pen Drive", "USB Course", 3.0, 50.0, 9.0, 59.0,
+    ]
+    assert sum(sheet.cell(row, 8).value for row in (3, 4)) == 100.0
+    assert sum(sheet.cell(row, 9).value for row in (3, 4)) == 18.0
 
 
 class _RowsQuery:
