@@ -837,6 +837,87 @@ def _customer_performance(
     }
 
 
+def _customer_mix_context(channel: str, grain: str, period: str, selected_year: int) -> dict[str, object]:
+    """Build customer-mix trend and AOV context from the same cached order rows.
+
+    The existing headline counts deliberately remain untouched.  For the new
+    monthly context, a customer is new/returning using that month's existing
+    count rule (one identified row/new, more than one/returning).
+    """
+    current = datetime.now()
+    upload_dates = _cached_upload_dates()
+    events: list[tuple[str, str, float, str]] = []
+    sources = (
+        ("dsg", DSGDatasetRow), ("sfh", SFHDatasetRow),
+        ("amazon", AmazonDatasetRow), ("direct", DirectSalesDatasetRow),
+    )
+    email_aliases = {
+        "dsg": ("email (billing)",), "sfh": ("email",),
+        "amazon": ("buyer email", "email"),
+        "direct": ("email", "customer email", "email (billing)", "client email", "client name", "customer name", "customer display name", "contact name", "billing name", "company name"),
+    }
+    for source, model in sources:
+        if channel not in {"all", source}:
+            continue
+        charged_orders: set[str] = set()
+        for row in _cached_rows(model):
+            if source == "dsg" and not _dsg_is_completed(row):
+                continue
+            if source == "amazon" and _amazon_is_cancelled(row):
+                continue
+            email = str(_first_nonempty_row_value(row.row_data, email_aliases[source]) or "").strip().casefold()
+            if not email:
+                continue
+            if source == "dsg":
+                amount, label = _dsg_pnl_amount(row, charged_orders), "DSG"
+            elif source == "sfh":
+                amount, label = _number(sfh_amount_from_record(row.row_data)), "SFH"
+            elif source == "amazon":
+                amount, label = _number(row.amount), "Amazon"
+            else:
+                amount, label = _direct_amount(row), "Direct Sales"
+            events.append((_month(row.row_data, upload_dates.get(row.upload_id, current)), email, amount, f"{label}:{_order_identifier(label, row) or row.id}"))
+
+    if grain == "monthly":
+        anchor_month = max(int(value) for value in period.split(","))
+        anchor = datetime(selected_year, anchor_month, 1)
+    else:
+        anchor = datetime.now().replace(day=1)
+    months = []
+    for offset in range(5, -1, -1):
+        month = (anchor.replace(day=1) - timedelta(days=1)) if offset else anchor
+        for _ in range(max(offset - 1, 0)):
+            month = month.replace(day=1) - timedelta(days=1)
+        months.append(month.strftime("%Y-%m"))
+
+    trend = []
+    monthly_aov: dict[str, dict[str, float]] = {}
+    for month_key in months:
+        rows = [(email, amount, order) for month, email, amount, order in events if month == month_key]
+        counts: dict[str, int] = defaultdict(int)
+        for email, _, _ in rows:
+            counts[email] += 1
+        new = sum(count == 1 for count in counts.values())
+        returning = sum(count > 1 for count in counts.values())
+        total = new + returning
+        grouped: dict[str, dict[str, object]] = {"new": {"amount": 0.0, "orders": set()}, "returning": {"amount": 0.0, "orders": set()}}
+        for email, amount, order in rows:
+            cohort = "new" if counts[email] == 1 else "returning"
+            grouped[cohort]["amount"] = float(grouped[cohort]["amount"]) + amount
+            grouped[cohort]["orders"].add(order)  # type: ignore[union-attr]
+        monthly_aov[month_key] = {
+            cohort: _rounded(float(values["amount"]) / len(values["orders"])) if values["orders"] else 0.0
+            for cohort, values in grouped.items()
+        }
+        year, month = (int(value) for value in month_key.split("-"))
+        trend.append({"key": month_key, "label": datetime(year, month, 1).strftime("%b"), "new_percent": _rounded(new / total * 100) if total else 0.0, "returning_percent": _rounded(returning / total * 100) if total else 0.0})
+    current_aov = monthly_aov.get(months[-1], {"new": 0.0, "returning": 0.0})
+    repeat_delta = _rounded(trend[-1]["returning_percent"] - trend[-2]["returning_percent"]) if len(trend) > 1 else 0.0
+    recent = [float(point["returning_percent"]) for point in trend[-3:]]
+    is_declining = len(recent) == 3 and recent[0] > recent[1] > recent[2]
+    return {"trend": trend, "aov": current_aov, "repeat_rate_delta": repeat_delta, "repeat_rate_declining": is_declining}
+
+
 def _state_performance(
     channel: str, grain: str, period: str, selected_year: int, include_details: bool = False
 ) -> list[dict[str, object]] | tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -946,6 +1027,11 @@ def _state_performance(
                 }[source]
                 customer = str(_first_nonempty_row_value(row.row_data, email_aliases) or "").strip().casefold()
                 order_details[-1]["email"] = customer
+                customer_name = str(_first_nonempty_row_value(row.row_data, (
+                    "customer name", "customer display name", "client name", "contact name",
+                    "billing name", "company name", "name", "buyer name",
+                )) or "").strip()
+                order_details[-1]["customer_name"] = customer_name
                 if customer:
                     state_customers[state_key].add(customer)
     summary = [
@@ -1177,6 +1263,7 @@ def _build_dashboard_kpis(
         period,
         primary_year,
     )
+    customer_performance.update(_customer_mix_context(channel, grain, period, primary_year))
     state_performance, state_order_details = _state_performance(
         channel, grain, period, primary_year, include_details=True
     )
