@@ -77,11 +77,15 @@ type DashboardData = {
     repeat_customers: number
     unique_percent: number
     repeat_percent: number
+    trend: { key: string; label: string; new_percent: number; returning_percent: number }[]
+    aov: { new: number; returning: number }
+    repeat_rate_delta: number
+    repeat_rate_declining: boolean
   }
   state_performance: { state: string; amount: number; orders: number; customers: number }[]
   state_order_details: {
     year: number; month: number; channel: string; order_id: string; category: string
-    description: string; quantity: number; sales: number; state: string; email?: string
+    description: string; quantity: number; sales: number; state: string; email?: string; customer_name?: string
     classification: 'india' | 'international' | 'invalid'
   }[]
   direct_sales_performance: {
@@ -917,21 +921,40 @@ function CustomersByEmail({
   loading,
   period,
   orderDetails,
+  channel,
+  onChannelChange,
+  dateFilter,
 }: {
   data: DashboardData['customer_performance']
   loading: boolean
   period: string
   orderDetails: DashboardData['state_order_details']
+  channel: string
+  onChannelChange: (channel: string) => void
+  dateFilter: React.ReactNode
 }) {
   const [tableOpen, setTableOpen] = useState(false)
   const [orderChannel, setOrderChannel] = useState('all')
-  const [cohort, setCohort] = useState<'new' | 'returning'>('new')
-  const filteredOrders = orderDetails.filter((row) => row.email && (orderChannel === 'all' || row.channel === orderChannel))
+  const [orderCategory, setOrderCategory] = useState('all')
+  const [cohort, setCohort] = useState<'all' | 'new' | 'returning'>('all')
+  const filteredOrders = orderDetails.filter((row) => row.email && (orderChannel === 'all' || row.channel === orderChannel) && (orderCategory === 'all' || row.category === orderCategory))
+  const orderCategories = [...new Set(orderDetails.map((row) => row.category).filter(Boolean))].sort()
   const emailCounts = filteredOrders.reduce<Record<string, number>>((counts, row) => { const email = row.email!.toLowerCase(); counts[email] = (counts[email] ?? 0) + 1; return counts }, {})
   // Cohorts are mutually exclusive in the active filtered primary dataset.
-  const orders = filteredOrders.filter((row) => cohort === 'new'
+  const orders = filteredOrders.filter((row) => cohort === 'all' || (cohort === 'new'
     ? emailCounts[row.email!.toLowerCase()] === 1
-    : emailCounts[row.email!.toLowerCase()] > 1)
+    : emailCounts[row.email!.toLowerCase()] > 1))
+  const cohortSales = orders.reduce((sum, row) => sum + row.sales, 0)
+  const cohortOrders = new Set(orders.map((row) => `${row.channel}:${row.order_id || `${row.year}-${row.month}-${row.email}-${row.description}`}`)).size
+  const money = (value: number) => `₹${Math.round(value).toLocaleString('en-IN')}`
+  const delta = data.repeat_rate_delta ?? 0
+  const downloadCustomerOrders = () => downloadCsv(
+    `customer-${cohort}-orders.csv`,
+    ['Year', 'Month', 'Email ID', 'Channel', 'Category', 'Description', 'Qty', 'Sales'],
+    orders.map((row) => [row.year, row.month, row.email ?? '', row.channel, row.category, row.description, row.quantity, row.sales]),
+  )
+  const priorMonth = data.trend?.at(-2)
+  const priorMonthLabel = priorMonth ? new Date(`${priorMonth.key}-01T00:00:00`).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' }) : 'prior month'
   useEffect(() => {
     if (data.unique_customers + data.repeat_customers !== data.total_customers) console.warn('Customer mix totals do not reconcile.', data)
   }, [data])
@@ -948,7 +971,12 @@ function CustomersByEmail({
         <div><span><i className="repeat" />Returning customers</span><strong>{data.repeat_customers.toLocaleString('en-IN')}</strong></div>
       </div>
     </div> : <div className="detail-empty detail-empty-large">No Data Available</div>}
-    {tableOpen && <div className="customer-orders"><label>Channel <select value={orderChannel} onChange={(event) => setOrderChannel(event.target.value)}><option value="all">All channels</option>{[...new Set(orderDetails.map((row) => row.channel))].map((channel) => <option key={channel} value={channel}>{channel}</option>)}</select></label><span>Date range: {period}</span><table><thead><tr><th>Year</th><th>Month</th><th>Channel</th><th>{cohort === 'new' ? 'New customer' : 'Returning customer'}</th><th>Email</th><th>Category</th><th>Description</th><th>Sales</th></tr></thead><tbody>{orders.map((row, index) => <tr key={`${row.order_id}-${index}`}><td>{row.year}</td><td>{row.month}</td><td>{row.channel}</td><td>{cohort === 'new' ? 'New' : 'Returning'}</td><td>{row.email}</td><td>{row.category}</td><td>{row.description}</td><td>{row.sales.toLocaleString('en-IN')}</td></tr>)}</tbody></table></div>}
+    <div className="customer-kpi-filters"><label><span>Channel</span><select value={channel} onChange={(event) => onChannelChange(event.target.value)}><option value="all">All channels</option><option value="dsg">DSG</option><option value="sfh">SFH</option><option value="amazon">Amazon</option><option value="direct">Direct Sales</option></select></label>{dateFilter}</div>
+    <div className="customer-metrics" aria-label="Customer performance KPIs">
+      <div className="is-drilldown" role="button" tabIndex={0} aria-label="View all identified customer orders" onClick={() => { setCohort('all'); setTableOpen(true) }}><span>Identified customers</span><strong>{data.total_customers.toLocaleString('en-IN')}</strong><em>Click to view orders →</em></div><div className="is-drilldown" role="button" tabIndex={0} aria-label="View new customer orders" onClick={() => { setCohort('new'); setTableOpen(true) }}><span>New customers</span><strong>{data.unique_customers.toLocaleString('en-IN')} <small>{Math.round(data.unique_percent)}%</small></strong><em>Click to view orders →</em></div><div className="is-drilldown" role="button" tabIndex={0} aria-label="View returning customer orders" onClick={() => { setCohort('returning'); setTableOpen(true) }}><span>Returning customers</span><strong>{data.repeat_customers.toLocaleString('en-IN')} <small>{Math.round(data.repeat_percent)}%</small></strong><em>Click to view orders →</em></div><div><span>Repeat rate vs {priorMonthLabel}</span><strong className={delta < 0 ? 'is-down' : 'is-up'}>{delta >= 0 ? '↑ +' : '↘ '}{Math.abs(delta).toFixed(1)}pt</strong></div>
+    </div>
+    {data.total_customers ? <div className="customer-split-bar" aria-label={`${Math.round(data.unique_percent)}% new customers and ${Math.round(data.repeat_percent)}% returning customers`}><span className="new" style={{ width: `${data.unique_percent}%` }}>New · {data.unique_customers.toLocaleString('en-IN')} · {Math.round(data.unique_percent)}%</span><span className="returning" style={{ width: `${data.repeat_percent}%` }}>{data.repeat_customers.toLocaleString('en-IN')} · {Math.round(data.repeat_percent)}%</span></div> : <div className="detail-empty">No customer data available</div>}
+    {tableOpen && <div className="customer-orders"><div className="customer-orders-head"><strong>{cohort === 'all' ? 'All identified customers' : cohort === 'new' ? 'New customers' : 'Returning customers'}</strong><label>Channel <select value={orderChannel} onChange={(event) => setOrderChannel(event.target.value)}><option value="all">All channels</option>{[...new Set(orderDetails.map((row) => row.channel))].map((channel) => <option key={channel} value={channel}>{channel}</option>)}</select></label><label>Category <select value={orderCategory} onChange={(event) => setOrderCategory(event.target.value)}><option value="all">All categories</option>{orderCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select></label><button type="button" disabled={!orders.length} onClick={downloadCustomerOrders}>↓ Download CSV</button><button type="button" onClick={() => setTableOpen(false)}>Close</button></div><div className="customer-orders-date-filter">{dateFilter}</div><div className="customer-table-kpis"><div><span>Total sales</span><strong>{money(cohortSales)}</strong></div><div><span>Total orders</span><strong>{cohortOrders.toLocaleString('en-IN')}</strong></div></div><table><thead><tr><th>Year</th><th>Month</th><th>Email ID</th><th>Category</th><th>Description</th><th>Qty</th><th>Sales</th></tr></thead><tbody>{orders.map((row, index) => <tr key={`${row.order_id}-${index}`}><td>{row.year}</td><td>{row.month}</td><td>{row.email}</td><td>{row.category}</td><td>{row.description}</td><td>{row.quantity}</td><td>{row.sales.toLocaleString('en-IN')}</td></tr>)}</tbody></table></div>}
   </section>
 }
 
@@ -1053,6 +1081,7 @@ function StateWisePerformance({ rows, orderDetails, loading, filters }: { rows: 
         <span><i className="international" />Other countries <strong>{format(nonIndianTotal)}</strong> ({share(nonIndianTotal).toFixed(1)}%)</span>
         <span><i className="invalid" />Unknown <strong>{format(invalidTotal)}</strong> ({share(invalidTotal).toFixed(1)}%)</span>
       </div>
+      <p className="state-location-drilldown-hint"><span aria-hidden="true">↗</span> Click a location bar to view its order table.</p>
       <div className="state-location-groups">
         {groups.map((group) => {
           const tailRows = group.rows.filter((row) => share(row.amount) < STATE_SHARE_COLLAPSE_THRESHOLD)
@@ -1150,7 +1179,8 @@ function DashboardPage() {
   const [dateEnd, setDateEnd] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [expanded, setExpanded] = useState<string | null>(null)
+  // The All Channels view is the summary view, so expose every KPI breakdown on load.
+  const [expanded, setExpanded] = useState<string | null>(initialFilters.channel === 'all' ? 'all' : null)
   const [categoryPeriodView, setCategoryPeriodView] = useState<'both' | 'current' | 'comparison'>('both')
   const [channelPeriodView, setChannelPeriodView] = useState<'both' | 'current' | 'comparison'>('both')
   const [selectedChannelCell, setSelectedChannelCell] = useState<string | null>(null)
@@ -1254,6 +1284,7 @@ function DashboardPage() {
     const appliedComparison = draftComparison.grain === 'yearly' ? { ...draftComparison, period: String(draftComparisonYear) } : draftComparison
     setLoading(true)
     setSelected(draftChannel)
+    setExpanded(draftChannel === 'all' ? 'all' : null)
     setTime(appliedTime)
     setActiveYear(appliedYear)
     setComparison(appliedComparison)
@@ -1453,6 +1484,12 @@ function DashboardPage() {
     <div className="summary-period is-comparison"><span>Comparison period</span><div><small>Total actual</small><strong>{number(comparisonTotal)}</strong></div><div><small>Difference</small><strong className={comparisonDifference >= 0 ? 'positive' : 'negative'}>{comparisonDifference >= 0 ? '+' : '−'}{number(Math.abs(comparisonDifference))}</strong></div></div>
   </div>
 
+  const showAllChannelsDashboard = () => {
+    setDashboardView('overview')
+    setDraftChannel('all')
+    setSelected('all')
+    setExpanded('all')
+  }
   if (loading && !data) return <div className="content"><div className="dashboard-loading">Calculating reviewed sales KPIs…</div></div>
   if (data && dashboardView !== 'overview') {
     const pageTitle = dashboardView === 'product' ? 'Product performance' : dashboardView === 'state' ? 'State performance' : 'Customer performance'
@@ -1462,7 +1499,7 @@ function DashboardPage() {
       <div className="dashboard-subpage-content">
         {dashboardView === 'product' && <ProductRankings data={data.product_performance} loading={loading} dateFilter={renderDateRangeFilter()} />}
         {dashboardView === 'state' && <StateWisePerformance rows={data.state_performance} orderDetails={data.state_order_details ?? []} loading={loading} filters={renderStateFilters()} />}
-        {dashboardView === 'customer' && <CustomersByEmail data={data.customer_performance} loading={loading} period={periodDisplay(time, activeYear)} orderDetails={data.state_order_details ?? []} />}
+        {dashboardView === 'customer' && <CustomersByEmail data={data.customer_performance} loading={loading} period={periodDisplay(time, activeYear)} orderDetails={data.state_order_details ?? []} channel={selected} onChannelChange={setSelected} dateFilter={renderDateRangeFilter()} />}
       </div>
     </div>
   }
@@ -1494,9 +1531,11 @@ function DashboardPage() {
                 setDraftChannel(channel)
                 setLoading(true)
                 setSelected(channel)
+                setExpanded(channel === 'all' ? 'all' : null)
               }}><option value="all">All Channels</option><option value="dsg">DSG</option><option value="sfh">SFH</option><option value="amazon">Amazon</option><option value="direct">Direct Sales</option></select>
               return null
             })}
+            <button className={dashboardView === 'overview' ? 'active' : ''} type="button" onClick={showAllChannelsDashboard}>All channels</button>
             <button className="product-performance-button" type="button" onClick={() => setDashboardView('product')}>Product performance <span aria-hidden="true">→</span></button>
             <button type="button" onClick={() => setDashboardView('state')}>State performance</button>
             <button type="button" onClick={() => setDashboardView('customer')}>Customer performance</button>
@@ -1506,7 +1545,7 @@ function DashboardPage() {
           <div className="filter-group">
             <span className="filter-label">Channel</span>
             <div className="dashboard-filters">
-              {data.filters.map((filter) => <button className={selected === filter.id ? 'active' : ''} key={filter.id} onClick={() => { setLoading(true); setSelected(filter.id) }}>{filter.label}</button>)}
+              {data.filters.map((filter) => <button className={selected === filter.id ? 'active' : ''} key={filter.id} onClick={() => { setLoading(true); setSelected(filter.id); setExpanded(filter.id === 'all' ? 'all' : null) }}>{filter.label}</button>)}
             </div>
           </div>
           <div className="filter-group">
@@ -1531,7 +1570,7 @@ function DashboardPage() {
         </div>
         <section className={`kpi-grid ${selected !== 'all' ? 'channel-view' : ''} ${loading ? 'is-loading' : ''}`}>
           {data.cards.map((card) => {
-            const isExpanded = expanded === card.id
+            const isExpanded = expanded === 'all' || expanded === card.id
             const trend = trendDetails(card.trend)
             const isAllChannelsPnl = selected === 'all' && card.id === 'pnl'
             const isAllChannelsTaxCard = selected === 'all' && ['zero_rated', 'exempted', 'taxable'].includes(card.id)
@@ -1743,7 +1782,7 @@ function DashboardPage() {
         {selected !== 'all' && <>
           <TopProductByChannel channels={data.product_performance.channels} loading={loading} />
           <StateWisePerformance rows={data.state_performance} orderDetails={data.state_order_details ?? []} loading={loading} filters={renderStateFilters()} />
-          <CustomersByEmail data={data.customer_performance} loading={loading} period={periodDisplay(time, activeYear)} orderDetails={data.state_order_details ?? []} />
+          <CustomersByEmail data={data.customer_performance} loading={loading} period={periodDisplay(time, activeYear)} orderDetails={data.state_order_details ?? []} channel={selected} onChannelChange={setSelected} dateFilter={renderDateRangeFilter()} />
         </>}
         </div>
       </>}
