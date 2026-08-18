@@ -1,15 +1,68 @@
 from collections import defaultdict
-from datetime import datetime
+from contextlib import nullcontext
+from datetime import datetime, timedelta
+from threading import Lock
+from time import monotonic
 from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException
+from sqlalchemy import func
 
 from app.database.database import SessionLocal
-from app.database.models import DirectSalesDatasetRow, DSGDatasetRow, SFHDatasetRow, UploadHistory
+from app.database.models import AmazonDatasetRow, DirectSalesDatasetRow, DSGDatasetRow, SFHDatasetRow, UploadHistory
 from app.calculations.amounts import sfh_amount_from_record, sfh_is_inr_currency
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+DASHBOARD_CACHE_TTL_SECONDS = 300
+_dashboard_response_cache: dict[tuple[object, ...], tuple[float, dict[str, object]]] = {}
+_dashboard_cache_lock = Lock()
+_dashboard_source_cache: dict[str, object] = {}
+_dashboard_source_lock = Lock()
+_month_value_cache: dict[int, str] = {}
+
+
+def _dashboard_data_version() -> tuple[int, str]:
+    """Cheaply invalidate cached visuals whenever upload history changes."""
+    with SessionLocal() as database:
+        count, latest_upload = database.query(
+            func.count(UploadHistory.upload_id), func.max(UploadHistory.uploaded_at)
+        ).one()
+    return int(count or 0), latest_upload.isoformat() if latest_upload else ""
+
+
+def _dashboard_source_snapshot() -> dict[str, object]:
+    """Load every dashboard source once and reuse it across all visual builders."""
+    version = _dashboard_data_version()
+    with _dashboard_source_lock:
+        if _dashboard_source_cache.get("version") == version:
+            return _dashboard_source_cache
+        with SessionLocal() as database:
+            history = database.query(UploadHistory).all()
+            snapshot: dict[str, object] = {
+                "version": version,
+                "history": history,
+                "upload_dates": {item.upload_id: item.uploaded_at for item in history},
+                "DSGDatasetRow": database.query(DSGDatasetRow).all(),
+                "SFHDatasetRow": database.query(SFHDatasetRow).all(),
+                "AmazonDatasetRow": database.query(AmazonDatasetRow).all(),
+                "DirectSalesDatasetRow": database.query(DirectSalesDatasetRow).all(),
+            }
+        _dashboard_source_cache.clear()
+        _dashboard_source_cache.update(snapshot)
+        _month_value_cache.clear()
+        return _dashboard_source_cache
+
+
+def _cached_rows(model) -> list:
+    snapshot = _dashboard_source_cache or _dashboard_source_snapshot()
+    return snapshot[model.__name__]  # type: ignore[return-value]
+
+
+def _cached_upload_dates() -> dict[str, datetime]:
+    snapshot = _dashboard_source_cache or _dashboard_source_snapshot()
+    return snapshot["upload_dates"]  # type: ignore[return-value]
 
 CATEGORY_ORDER = ("Web Version", "Audio Device", "Pen Drive", "Books")
 CATEGORY_MONTHLY_PLANS = {
@@ -21,7 +74,9 @@ CATEGORY_MONTHLY_PLANS = {
 INDIAN_STATE_NAMES = {
     "AN": "Andaman and Nicobar Islands", "AP": "Andhra Pradesh", "AR": "Arunachal Pradesh",
     "AS": "Assam", "BR": "Bihar", "CH": "Chandigarh", "CG": "Chhattisgarh",
-    "CT": "Chhattisgarh", "DL": "Delhi", "GA": "Goa", "GJ": "Gujarat",
+    "CT": "Chhattisgarh", "DN": "Dadra and Nagar Haveli and Daman and Diu",
+    "DD": "Dadra and Nagar Haveli and Daman and Diu", "DL": "Delhi",
+    "GA": "Goa", "GJ": "Gujarat",
     "HR": "Haryana", "HP": "Himachal Pradesh", "JK": "Jammu and Kashmir",
     "JH": "Jharkhand", "KA": "Karnataka", "KL": "Kerala", "LA": "Ladakh",
     "LD": "Lakshadweep", "MP": "Madhya Pradesh", "MH": "Maharashtra",
@@ -31,8 +86,66 @@ INDIAN_STATE_NAMES = {
     "TG": "Telangana", "TR": "Tripura", "UP": "Uttar Pradesh",
     "UK": "Uttarakhand", "UT": "Uttarakhand", "WB": "West Bengal",
 }
+
+COUNTRY_NAMES = {
+    "AT": "Austria", "BR": "Brazil", "CA": "Canada", "FI": "Finland",
+    "GB": "United Kingdom", "IN": "India", "LU": "Luxembourg",
+    "US": "United States",
+}
+
+REGION_NAMES_BY_COUNTRY = {
+    "IN": INDIAN_STATE_NAMES,
+    "US": {
+        "CA": "California", "FL": "Florida", "MN": "Minnesota",
+        "NY": "New York", "OH": "Ohio", "TX": "Texas",
+        "VA": "Virginia", "WA": "Washington",
+    },
+    "CA": {"ON": "Ontario"},
+    "BR": {"PR": "Paraná"},
+}
+
+# Full names can be identified safely even when a source file has no country
+# column. Only names that resolve unambiguously in the current supported data
+# are included here; unknown abbreviations are never guessed.
+REGION_COUNTRY_BY_NAME = {
+    **{name.casefold(): (name, "India") for name in set(INDIAN_STATE_NAMES.values())},
+    **{
+        name.casefold(): (name, "United States")
+        for name in set(REGION_NAMES_BY_COUNTRY["US"].values())
+    },
+    "ontario": ("Ontario", "Canada"),
+    "parana": ("Paraná", "Brazil"),
+    "paraná": ("Paraná", "Brazil"),
+    "andhra pradesh (new)": ("Andhra Pradesh", "India"),
+    "andhra pradesh(before division": ("Andhra Pradesh", "India"),
+}
+
+
+def _state_name(value: object, country_value: object = "") -> str:
+    """Resolve a region using its country, without guessing ambiguous codes."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "Unknown/Invalid"
+
+    country_code = str(country_value or "").strip().upper()
+    country_name = COUNTRY_NAMES.get(country_code)
+    if country_code:
+        region_name = REGION_NAMES_BY_COUNTRY.get(country_code, {}).get(raw.upper())
+        if region_name and country_name:
+            return f"{region_name}, {country_name}"
+        named_region = REGION_COUNTRY_BY_NAME.get(raw.casefold())
+        if named_region and named_region[1] == country_name:
+            return f"{named_region[0]}, {named_region[1]}"
+        return "Unknown/Invalid"
+
+    named_region = REGION_COUNTRY_BY_NAME.get(raw.casefold())
+    if named_region:
+        return f"{named_region[0]}, {named_region[1]}"
+    return "Unknown/Invalid"
 DATE_ALIASES = (
     "order date",
+    "purchase date",
+    "purchase-date",
     "issue date",
     "date",
     "created at",
@@ -47,6 +160,12 @@ def _normalise(value: object) -> str:
 def _row_value(data: dict[str, Any], aliases: tuple[str, ...]) -> object | None:
     values = {_normalise(key): value for key, value in data.items()}
     return next((values[alias] for alias in aliases if alias in values), None)
+
+
+def _first_nonempty_row_value(data: dict[str, Any], aliases: tuple[str, ...]) -> object | None:
+    """Return the first populated alias, allowing sparse export columns to fall back."""
+    values = {_normalise(key): value for key, value in data.items()}
+    return next((values[alias] for alias in aliases if alias in values and values[alias] not in (None, "")), None)
 
 
 def _number(value: object) -> float:
@@ -89,13 +208,116 @@ def _direct_sales_channel(row: DirectSalesDatasetRow) -> str:
         return 0.0
 
 
+def _amazon_is_cancelled(row: AmazonDatasetRow) -> bool:
+    """Excluded Amazon statuses remain stored but never contribute to MIS values."""
+    status = _row_value(row.row_data, ("order status", "order-status"))
+    return str(status or "").strip().casefold() in {
+        "cancelled", "shipped - returning to seller",
+    }
+
+
+def _dsg_is_completed(row: DSGDatasetRow) -> bool:
+    """Only completed DSG orders contribute to calculations and reports."""
+    status = _row_value(row.row_data, ("order status",))
+    return str(status or "").strip().casefold() == "completed"
+
+
+def _order_identifier(channel: str, row) -> str:
+    """Return the normalized business order identifier for a valid channel row."""
+    if channel == "DSG":
+        value = row.order_number or _row_value(row.row_data, ("order number",))
+    elif channel == "SFH":
+        value = _row_value(row.row_data, ("invoice no.", "invoice no", "invoice number"))
+    elif channel == "Direct Sales":
+        value = row.order_number or _row_value(row.row_data, ("invoice number",))
+    else:
+        value = _row_value(row.row_data, ("amazon-order-id", "amazon order id"))
+    return str(value or "").strip().casefold()
+
+
+def _unique_order_count(rows) -> int:
+    """Count unique valid orders per channel without cross-channel ID collisions."""
+    orders: set[tuple[str, str]] = set()
+    for channel, row, _ in rows:
+        if channel == "DSG" and not _dsg_is_completed(row):
+            continue
+        if channel == "Amazon" and _amazon_is_cancelled(row):
+            continue
+        identifier = _order_identifier(channel, row)
+        if identifier:
+            orders.add((channel, identifier))
+    return len(orders)
+
+
+def _period_order_counts(grain: str, period: str, year: int) -> dict[str, int]:
+    """Return unique KPI order counts by channel using the report rules."""
+    selected_months = (
+        {int(value) for value in period.split(",")}
+        if grain == "monthly" else set()
+    )
+
+    def included(month_key: str) -> bool:
+        row_year, row_month = (int(value) for value in month_key.split("-"))
+        if grain == "monthly":
+            return row_year == year and row_month in selected_months
+        if grain == "quarterly":
+            first_month = (int(period) - 1) * 3 + 1
+            return row_year == year and first_month <= row_month <= first_month + 2
+        return row_year == year
+
+    models = (
+        ("DSG", DSGDatasetRow), ("SFH", SFHDatasetRow),
+        ("Amazon", AmazonDatasetRow), ("Direct Sales", DirectSalesDatasetRow),
+    )
+    current = datetime.now()
+    rows_by_channel: dict[str, list] = {name: [] for name, _ in models}
+    with nullcontext():
+        upload_dates = _cached_upload_dates()
+        for channel_name, model in models:
+            for row in _cached_rows(model):
+                month_key = _month(row.row_data, upload_dates.get(row.upload_id, current))
+                if included(month_key):
+                    rows_by_channel[channel_name].append((channel_name, row, month_key))
+    return {
+        channel_name: _unique_order_count(rows)
+        for channel_name, rows in rows_by_channel.items()
+    }
+
+
+def _dsg_pnl_amount(row: DSGDatasetRow, charged_orders: set[str]) -> float:
+    """Return DSG P&L value, allocating filled-down shipping once per order."""
+    data = row.row_data
+    basic_source = _row_value(data, ("item cost × quantity", "item cost x quantity"))
+    basic_value = _number(basic_source if basic_source is not None else row.amount)
+    discount = _number(_row_value(data, ("cart discount amount",)))
+    order_number = str(
+        row.order_number or _row_value(data, ("order number",)) or ""
+    ).strip().casefold()
+    include_shipping = order_number not in charged_orders
+    if include_shipping:
+        charged_orders.add(order_number)
+    shipping = (
+        _number(_row_value(data, ("order shipping amount",)))
+        if include_shipping else 0.0
+    )
+    return basic_value + shipping + discount
+
+
 def _month(data: dict[str, Any], fallback: datetime) -> str:
+    cache_key = id(data)
+    cached = _month_value_cache.get(cache_key)
+    if cached is not None:
+        return cached
     value = _row_value(data, DATE_ALIASES)
     if value is not None:
         parsed = pd.to_datetime(value, errors="coerce")
         if not pd.isna(parsed):
-            return parsed.strftime("%Y-%m")
-    return fallback.strftime("%Y-%m")
+            result = parsed.strftime("%Y-%m")
+            _month_value_cache[cache_key] = result
+            return result
+    result = fallback.strftime("%Y-%m")
+    _month_value_cache[cache_key] = result
+    return result
 
 
 def _empty_month_metrics() -> defaultdict[str, Any]:
@@ -243,24 +465,25 @@ def _load_channel_metrics() -> dict[str, dict[str, Any]]:
     channels = {
         "dsg": _empty_metrics(),
         "sfh": _empty_metrics(),
+        "amazon": _empty_metrics(),
         "direct": _empty_metrics(),
     }
-    with SessionLocal() as database:
-        upload_dates = {
-            item.upload_id: item.uploaded_at
-            for item in database.query(UploadHistory).all()
-        }
-        for row in database.query(DSGDatasetRow).all():
+    with nullcontext():
+        upload_dates = _cached_upload_dates()
+        dsg_charged_orders: set[str] = set()
+        for row in _cached_rows(DSGDatasetRow):
+            if not _dsg_is_completed(row):
+                continue
             uploaded_at = upload_dates.get(row.upload_id, datetime.now())
             country_code = _row_value(row.row_data, ("country code (billing)",))
             _add_row(
                 channels["dsg"],
                 category=row.category or "",
-                amount=_number(row.amount),
+                amount=_dsg_pnl_amount(row, dsg_charged_orders),
                 is_foreign=str(country_code).strip().upper() != "IN",
                 month=_month(row.row_data, uploaded_at),
             )
-        for row in database.query(SFHDatasetRow).all():
+        for row in _cached_rows(SFHDatasetRow):
             uploaded_at = upload_dates.get(row.upload_id, datetime.now())
             currency = _row_value(row.row_data, ("currency",))
             _add_row(
@@ -270,7 +493,18 @@ def _load_channel_metrics() -> dict[str, dict[str, Any]]:
                 is_foreign=not sfh_is_inr_currency(currency),
                 month=_month(row.row_data, uploaded_at),
             )
-        for row in database.query(DirectSalesDatasetRow).all():
+        for row in _cached_rows(AmazonDatasetRow):
+            if _amazon_is_cancelled(row):
+                continue
+            uploaded_at = upload_dates.get(row.upload_id, datetime.now())
+            _add_row(
+                channels["amazon"],
+                category="Books",
+                amount=_number(row.amount),
+                is_foreign=str(row.currency or "").strip().upper() != "INR",
+                month=_month(row.row_data, uploaded_at),
+            )
+        for row in _cached_rows(DirectSalesDatasetRow):
             uploaded_at = upload_dates.get(row.upload_id, datetime.now())
             _add_row(
                 channels["direct"],
@@ -312,12 +546,9 @@ def _direct_sales_classification(
         )
 
     totals = {"Direct Sales": 0.0, "Stall Sales": 0.0, "Bulk Sales": 0.0, "Language Lab": 0.0}
-    with SessionLocal() as database:
-        upload_dates = {
-            item.upload_id: item.uploaded_at
-            for item in database.query(UploadHistory).all()
-        }
-        for row in database.query(DirectSalesDatasetRow).all():
+    with nullcontext():
+        upload_dates = _cached_upload_dates()
+        for row in _cached_rows(DirectSalesDatasetRow):
             month = _month(row.row_data, upload_dates.get(row.upload_id, current))
             if not included(month):
                 continue
@@ -333,12 +564,9 @@ def _language_lab_monthly() -> dict[str, float]:
     """Return Language Lab sales by month for Grand Total sales trends."""
     totals: dict[str, float] = defaultdict(float)
     current = datetime.now()
-    with SessionLocal() as database:
-        upload_dates = {
-            item.upload_id: item.uploaded_at
-            for item in database.query(UploadHistory).all()
-        }
-        for row in database.query(DirectSalesDatasetRow).all():
+    with nullcontext():
+        upload_dates = _cached_upload_dates()
+        for row in _cached_rows(DirectSalesDatasetRow):
             if _direct_sales_channel(row) != "Language Lab":
                 continue
             month = _month(row.row_data, upload_dates.get(row.upload_id, current))
@@ -420,16 +648,36 @@ def _product_rankings(
     totals: dict[str, dict[str, float]] = {
         "dsg": defaultdict(float),
         "sfh": defaultdict(float),
+        "amazon": defaultdict(float),
         "direct": defaultdict(float),
     }
-    labels: dict[str, dict[str, str]] = {"dsg": {}, "sfh": {}, "direct": {}}
-    with SessionLocal() as database:
-        upload_dates = {
-            item.upload_id: item.uploaded_at
-            for item in database.query(UploadHistory).all()
-        }
+    labels: dict[str, dict[str, str]] = {"dsg": {}, "sfh": {}, "amazon": {}, "direct": {}}
+    details: list[dict[str, object]] = []
+
+    def add_detail(channel_label: str, row: object, month_key: str, description: str, total_value: float) -> None:
+        data = getattr(row, "row_data", {}) or {}
+        year_value, month_value = month_key.split("-")
+        quantity = _number(_row_value(data, ("quantity", "qty", "item quantity")))
+        shipping = _number(_row_value(data, ("shipping", "shipping amount", "shipping charges")))
+        discount = _number(_row_value(data, ("discount", "discount amount")))
+        taxable = _number(_row_value(data, ("taxable value", "without tax total", "basic value")))
+        tax = _number(_row_value(data, ("tax", "tax amount", "gst", "total tax")))
+        basic = _number(_row_value(data, ("basic value", "item cost", "without tax total")))
+        details.append({
+            "year": int(year_value), "month": int(month_value), "channel": channel_label,
+            "category": str(getattr(row, "category", "") or ""), "orders": 1,
+            "quantity": quantity, "description": description, "basic_value": _rounded(basic),
+            "shipping": _rounded(shipping), "discount": _rounded(discount),
+            "taxable_value": _rounded(taxable), "tax": _rounded(tax),
+            "total_invoice_value": _rounded(total_value),
+        })
+    with nullcontext():
+        upload_dates = _cached_upload_dates()
         if channel in {"all", "dsg"}:
-            for row in database.query(DSGDatasetRow).all():
+            dsg_charged_orders: set[str] = set()
+            for row in _cached_rows(DSGDatasetRow):
+                if not _dsg_is_completed(row):
+                    continue
                 month = _month(
                     row.row_data,
                     upload_dates.get(row.upload_id, current),
@@ -438,9 +686,11 @@ def _product_rankings(
                 if product and included(month):
                     key = product.casefold()
                     labels["dsg"].setdefault(key, product)
-                    totals["dsg"][key] += _number(row.amount)
+                    amount = _dsg_pnl_amount(row, dsg_charged_orders)
+                    totals["dsg"][key] += amount
+                    add_detail("DSG", row, month, product, amount)
         if channel in {"all", "sfh"}:
-            for row in database.query(SFHDatasetRow).all():
+            for row in _cached_rows(SFHDatasetRow):
                 month = _month(
                     row.row_data,
                     upload_dates.get(row.upload_id, current),
@@ -449,22 +699,39 @@ def _product_rankings(
                 if course and included(month):
                     key = course.casefold()
                     labels["sfh"].setdefault(key, course)
-                    totals["sfh"][key] += _number(sfh_amount_from_record(row.row_data))
+                    amount = _number(sfh_amount_from_record(row.row_data))
+                    totals["sfh"][key] += amount
+                    add_detail("SFH", row, month, course, amount)
+        if channel in {"all", "amazon"}:
+            for row in _cached_rows(AmazonDatasetRow):
+                if _amazon_is_cancelled(row):
+                    continue
+                month = _month(row.row_data, upload_dates.get(row.upload_id, current))
+                product = str(row.product_name or "").strip()
+                if product and included(month):
+                    key = product.casefold()
+                    labels["amazon"].setdefault(key, product)
+                    amount = _number(row.amount)
+                    totals["amazon"][key] += amount
+                    add_detail("Amazon", row, month, product, amount)
         if channel in {"all", "direct"}:
-            for row in database.query(DirectSalesDatasetRow).all():
+            for row in _cached_rows(DirectSalesDatasetRow):
                 month = _month(row.row_data, upload_dates.get(row.upload_id, current))
                 product = str(row.product_name or "").strip()
                 if product and included(month):
                     key = product.casefold()
                     labels["direct"].setdefault(key, product)
-                    totals["direct"][key] += _direct_amount(row)
+                    amount = _direct_amount(row)
+                    totals["direct"][key] += amount
+                    add_detail("Direct Sales", row, month, product, amount)
 
     channel_labels = {
-        "dsg": ("Online Sales (DSG)", "Products"),
-        "sfh": ("Website Sales (SFH)", "Courses"),
+        "dsg": ("DSG", "Products"),
+        "sfh": ("SFH", "Courses"),
+        "amazon": ("Amazon", "Products"),
         "direct": ("Direct Sales", "Products"),
     }
-    requested_channels = ("dsg", "sfh", "direct") if channel == "all" else (channel,)
+    requested_channels = ("dsg", "sfh", "amazon", "direct") if channel == "all" else (channel,)
     sections = []
     for channel_id in requested_channels:
         ranked = [
@@ -487,7 +754,7 @@ def _product_rankings(
                 )[:5],
             }
         )
-    return {"channels": sections}
+    return {"channels": sections, "details": details}
 
 
 def _customer_performance(
@@ -520,29 +787,40 @@ def _customer_performance(
         )
 
     email_counts: dict[str, int] = defaultdict(int)
-    with SessionLocal() as database:
-        upload_dates = {
-            item.upload_id: item.uploaded_at
-            for item in database.query(UploadHistory).all()
-        }
+    with nullcontext():
+        upload_dates = _cached_upload_dates()
         if channel in {"all", "dsg"}:
-            for row in database.query(DSGDatasetRow).all():
+            for row in _cached_rows(DSGDatasetRow):
+                if not _dsg_is_completed(row):
+                    continue
                 month = _month(row.row_data, upload_dates.get(row.upload_id, current))
                 email = str(_row_value(row.row_data, ("email (billing)",)) or "").strip().casefold()
                 if email and included(month):
                     email_counts[email] += 1
         if channel in {"all", "sfh"}:
-            for row in database.query(SFHDatasetRow).all():
+            for row in _cached_rows(SFHDatasetRow):
                 month = _month(row.row_data, upload_dates.get(row.upload_id, current))
                 email = str(_row_value(row.row_data, ("email",)) or "").strip().casefold()
                 if email and included(month):
                     email_counts[email] += 1
         if channel in {"all", "direct"}:
-            for row in database.query(DirectSalesDatasetRow).all():
+            for row in _cached_rows(DirectSalesDatasetRow):
                 month = _month(row.row_data, upload_dates.get(row.upload_id, current))
                 email = str(
-                    _row_value(row.row_data, ("email", "customer email", "email (billing)")) or ""
+                    _first_nonempty_row_value(row.row_data, (
+                        "email", "customer email", "email (billing)", "client email",
+                        "client name", "customer name", "customer display name",
+                        "contact name", "billing name", "company name",
+                    )) or ""
                 ).strip().casefold()
+                if email and included(month):
+                    email_counts[email] += 1
+        if channel in {"all", "amazon"}:
+            for row in _cached_rows(AmazonDatasetRow):
+                if _amazon_is_cancelled(row):
+                    continue
+                month = _month(row.row_data, upload_dates.get(row.upload_id, current))
+                email = str(_row_value(row.row_data, ("buyer email", "email")) or "").strip().casefold()
                 if email and included(month):
                     email_counts[email] += 1
 
@@ -559,7 +837,9 @@ def _customer_performance(
     }
 
 
-def _state_performance(channel: str, grain: str, period: str, selected_year: int) -> list[dict[str, object]]:
+def _state_performance(
+    channel: str, grain: str, period: str, selected_year: int, include_details: bool = False
+) -> list[dict[str, object]] | tuple[list[dict[str, object]], list[dict[str, object]]]:
     selected_months = {int(value) for value in period.split(",")} if grain == "monthly" else set()
 
     def included(month_key: str) -> bool:
@@ -572,35 +852,107 @@ def _state_performance(channel: str, grain: str, period: str, selected_year: int
         return row_year == selected_year
 
     totals: dict[str, float] = defaultdict(float)
+    state_orders: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    state_customers: dict[str, set[str]] = defaultdict(set)
+    order_details: list[dict[str, object]] = []
+    sfh_invoice_ids: set[str] = set()
     current = datetime.now()
-    with SessionLocal() as database:
-        upload_dates = {item.upload_id: item.uploaded_at for item in database.query(UploadHistory).all()}
+    with nullcontext():
+        upload_dates = _cached_upload_dates()
         sources = []
         if channel in {"all", "dsg"}:
-            sources.append(("dsg", database.query(DSGDatasetRow).all()))
+            sources.append(("dsg", _cached_rows(DSGDatasetRow)))
         if channel in {"all", "sfh"}:
-            sources.append(("sfh", database.query(SFHDatasetRow).all()))
+            sources.append(("sfh", _cached_rows(SFHDatasetRow)))
+        if channel in {"all", "amazon"}:
+            sources.append(("amazon", _cached_rows(AmazonDatasetRow)))
         if channel in {"all", "direct"}:
-            sources.append(("direct", database.query(DirectSalesDatasetRow).all()))
+            sources.append(("direct", _cached_rows(DirectSalesDatasetRow)))
+        dsg_charged_orders: set[str] = set()
         for source, source_rows in sources:
             for row in source_rows:
-                if not included(_month(row.row_data, upload_dates.get(row.upload_id, current))):
+                if source == "dsg" and not _dsg_is_completed(row):
+                    continue
+                if source == "amazon" and _amazon_is_cancelled(row):
+                    continue
+                month_key = _month(row.row_data, upload_dates.get(row.upload_id, current))
+                if not included(month_key):
                     continue
                 if source == "dsg":
-                    code = str(_row_value(row.row_data, ("state code (billing)",)) or "").strip().upper()
-                    state = INDIAN_STATE_NAMES.get(code, code)
-                    amount = _number(row.amount)
+                    state = _state_name(
+                        _row_value(row.row_data, ("state code (billing)",)),
+                        _row_value(row.row_data, ("country code (billing)",)),
+                    )
+                    amount = _dsg_pnl_amount(row, dsg_charged_orders)
                 elif source == "sfh":
-                    state = str(_row_value(row.row_data, ("place of supply",)) or "").strip().title()
+                    state = _state_name(
+                        _first_nonempty_row_value(row.row_data, ("place of supply", "state"))
+                    )
                     amount = _number(sfh_amount_from_record(row.row_data))
+                elif source == "amazon":
+                    state = _state_name(
+                        row.state,
+                        _row_value(row.row_data, ("ship-country", "ship country", "country")),
+                    )
+                    amount = _number(row.amount)
                 else:
-                    state = str(_row_value(row.row_data, ("client state",)) or "").strip().title()
+                    state = _state_name(_row_value(row.row_data, ("client state",)))
                     amount = _direct_amount(row)
-                totals[state or "NA"] += amount
-    return [
-        {"state": state, "amount": _rounded(amount)}
+                state_key = state or "NA"
+                totals[state_key] += amount
+                channel_label = {"dsg": "DSG", "sfh": "SFH", "amazon": "Amazon", "direct": "Direct Sales"}[source]
+                order_id = _order_identifier(channel_label, row)
+                if order_id:
+                    state_orders[state_key].add((channel_label, order_id))
+                data = row.row_data or {}
+                description = str(
+                    getattr(row, "product_name", None)
+                    or getattr(row, "course", None)
+                    or _first_nonempty_row_value(data, ("description", "product name", "item name", "course"))
+                    or ""
+                ).strip()
+                category = str(
+                    getattr(row, "category", None)
+                    or _first_nonempty_row_value(data, ("mapped category", "category"))
+                    or ""
+                ).strip()
+                quantity = _number(_first_nonempty_row_value(data, ("quantity", "qty", "item quantity", "mapped quantity")))
+                # SFH has no source quantity. Its detail QTY is one per unique Invoice No.
+                if source == "sfh":
+                    quantity = 1.0 if order_id and order_id not in sfh_invoice_ids else 0.0
+                    if order_id:
+                        sfh_invoice_ids.add(order_id)
+                year_value, month_value = month_key.split("-")
+                classification = (
+                    "invalid" if state_key == "Unknown/Invalid"
+                    else "india" if state_key.endswith(", India")
+                    else "international"
+                )
+                order_details.append({
+                    "year": int(year_value), "month": int(month_value),
+                    "channel": channel_label, "order_id": order_id,
+                    "category": category, "description": description,
+                    "quantity": quantity, "sales": _rounded(amount),
+                    "state": state_key, "classification": classification,
+                })
+                email_aliases = {
+                    "dsg": ("email (billing)",), "sfh": ("email",),
+                    "amazon": ("buyer email", "email"),
+                    "direct": (
+                        "email", "customer email", "email (billing)", "client email",
+                        "client name", "customer name", "customer display name",
+                        "contact name", "billing name", "company name",
+                    ),
+                }[source]
+                customer = str(_first_nonempty_row_value(row.row_data, email_aliases) or "").strip().casefold()
+                order_details[-1]["email"] = customer
+                if customer:
+                    state_customers[state_key].add(customer)
+    summary = [
+        {"state": state, "amount": _rounded(amount), "orders": len(state_orders[state]), "customers": len(state_customers[state])}
         for state, amount in sorted(totals.items(), key=lambda item: (-item[1], item[0].casefold()))
     ]
+    return (summary, order_details) if include_details else summary
 
 
 def _rounded(value: float) -> float:
@@ -621,12 +973,12 @@ def _trend(metrics: dict[str, Any], metric: str, grain: str) -> list[float]:
     return [_rounded(aggregated[period]) for period in sorted(aggregated)]
 
 
-@router.get("/kpis")
-def dashboard_kpis(
+def _build_dashboard_kpis(
     channel: str = "all",
     grain: str = "monthly",
     period: str | None = None,
     year: int | None = None,
+    latest: bool = False,
     comparison_grain: str | None = None,
     comparison_period: str | None = None,
     comparison_year: int | None = None,
@@ -644,6 +996,21 @@ def dashboard_kpis(
         },
         reverse=True,
     )
+    if latest and grain == "monthly":
+        populated_months = sorted(
+            month
+            for metrics in channel_metrics.values()
+            for month, values in metrics["monthly"].items()
+            if values["pnl"] != 0
+        )
+        if populated_months:
+            latest_year, latest_month = (int(value) for value in populated_months[-1].split("-"))
+            period = str(latest_month)
+            year = latest_year
+            previous_date = datetime(latest_year, latest_month, 1) - timedelta(days=1)
+            comparison_grain = "monthly"
+            comparison_period = str(previous_date.month)
+            comparison_year = previous_date.year
     if period is None:
         period = (
             str(current.month)
@@ -665,8 +1032,9 @@ def dashboard_kpis(
     if not valid_period and not (grain == "yearly" and period == str(current.year)):
         raise HTTPException(status_code=422, detail="The selected time period is not available.")
     labels = {
-        "dsg": "Online Sales (DSG)",
-        "sfh": "Website Sales (SFH)",
+        "dsg": "DSG",
+        "sfh": "SFH",
+        "amazon": "Amazon",
         "direct": "Direct Sales",
     }
     available = {
@@ -809,7 +1177,9 @@ def dashboard_kpis(
         period,
         primary_year,
     )
-    state_performance = _state_performance(channel, grain, period, primary_year)
+    state_performance, state_order_details = _state_performance(
+        channel, grain, period, primary_year, include_details=True
+    )
     direct_sales_performance = {
         "current": _direct_sales_classification(grain, period, primary_year),
         "comparison": _direct_sales_classification(
@@ -819,10 +1189,10 @@ def dashboard_kpis(
         ),
     }
     digital_channels = (
-        ("dsg", "sfh")
+        ("dsg", "sfh", "amazon")
         if channel == "all"
         else (channel,)
-        if channel in {"dsg", "sfh"}
+        if channel in {"dsg", "sfh", "amazon"}
         else ()
     )
     digital_current = sum(
@@ -912,7 +1282,7 @@ def dashboard_kpis(
                 raise HTTPException(
                     status_code=500,
                     detail=(
-                        "The selected channel contains Sales as per P&L amounts "
+                        "The selected channel contains Total Sales amounts "
                         "without a complete product-category mapping."
                     ),
                 )
@@ -945,50 +1315,63 @@ def dashboard_kpis(
         return []
 
     card_definitions = (
-        ("zero_rated", "0 Rated Sales", "Non-INR Foreign Sales"),
-        ("exempted", "Exempted Sales", "No tax applied"),
-        ("taxable", "Taxable Amount", "Audio Device, Pen Drive, Web Version"),
-        ("pnl", "Sales as per P&L", "0 Rated + Exempted + Taxable"),
+        ("pnl", "Total Sales", "Foreign Sales + Books Sales + Taxable Sales"),
+        ("exempted", "Books Sales", "Books without tax"),
+        ("taxable", "Taxable Sales", "Web Version, Audio Device and Pen Drive sales"),
+        ("zero_rated", "Foreign Sales", "Sales outside India"),
+        ("orders", "Total Orders", "Unique valid orders"),
     )
-    if channel == "all":
-        sales_trend = {
-            "mode": "channel",
-            "points": [
-                {
-                    "label": labels[key],
-                    "value": _rounded(
-                        period_metrics[key]["pnl"]
-                        + (
-                            direct_sales_performance["current"]["Language Lab"]
-                            if key == "direct"
-                            else 0.0
-                        )
-                    ),
-                }
-                for key in ("dsg", "sfh", "direct")
-                if key in period_metrics
-            ],
-        }
-    else:
-        language_lab_monthly = _language_lab_monthly() if channel == "direct" else {}
-        month_points = []
-        for month_key, values in sorted(available[channel]["monthly"].items()):
-            row_year, row_month = (int(value) for value in month_key.split("-"))
-            if row_year == primary_year:
-                month_points.append({
-                    "label": datetime(row_year, row_month, 1).strftime("%b %Y"),
-                    "value": _rounded(values["pnl"] + language_lab_monthly.get(month_key, 0.0)),
-                })
-        sales_trend = {"mode": "month", "points": month_points}
+    language_lab_monthly = _language_lab_monthly()
+    trend_channels = tuple(channel_metrics) if channel == "all" else (channel,)
+    # Always expose the complete calendar year. The client can then switch
+    # between month, quarter, and year without fetching or changing the source.
+    trend_months = [f"{primary_year}-{month:02d}" for month in range(1, 13)]
+    sales_trend = {"monthly_points": []}
+    for month_key in trend_months:
+        trend_breakdown = {}
+        for channel_key in trend_channels:
+            # Trend rendering must be read-only. Accessing a missing key on the
+            # defaultdict would insert empty months into the shared KPI metrics.
+            month_values = channel_metrics[channel_key]["monthly"].get(month_key)
+            value = float(month_values["pnl"]) if month_values is not None else 0.0
+            if channel_key == "direct":
+                value += language_lab_monthly.get(month_key, 0.0)
+            trend_breakdown[labels[channel_key]] = _rounded(value)
+        row_year, row_month = (int(value) for value in month_key.split("-"))
+        sales_trend["monthly_points"].append({
+            "key": month_key,
+            "label": datetime(row_year, row_month, 1).strftime("%b %Y"),
+            "value": _rounded(sum(trend_breakdown.values())),
+            "breakdown": trend_breakdown,
+        })
+    order_channel_keys = {
+        "dsg": "DSG", "sfh": "SFH", "amazon": "Amazon", "direct": "Direct Sales",
+    }
+    order_channel_labels = {
+        "DSG": "DSG", "SFH": "SFH",
+        "Amazon": "Amazon", "Direct Sales": "Direct Sales",
+    }
+    current_order_counts = _period_order_counts(grain, period, primary_year)
+    comparison_order_counts = _period_order_counts(
+        table_comparison_grain, table_comparison_period, table_comparison_year
+    )
+    visible_order_channels = (
+        tuple(order_channel_keys.values())
+        if channel == "all" else (order_channel_keys[channel],)
+    )
+    current_order_total = sum(current_order_counts[name] for name in visible_order_channels)
+    comparison_order_total = sum(comparison_order_counts[name] for name in visible_order_channels)
     return {
         "selected_channel": channel,
         "selected_grain": grain,
         "selected_period": period,
+        "selected_year": primary_year,
         "available_years": available_years,
         "category_performance": category_performance,
         "product_performance": product_performance,
         "customer_performance": customer_performance,
         "state_performance": state_performance,
+        "state_order_details": state_order_details,
         "direct_sales_performance": direct_sales_performance,
         "channel_wise_performance": channel_wise_performance,
         "sales_trend": sales_trend,
@@ -1004,18 +1387,84 @@ def dashboard_kpis(
                 "id": metric,
                 "title": title,
                 "subtitle": subtitle,
-                "total": _rounded(selected[metric]),
-                "breakdown": breakdown(metric),
-                "trend": _trend(selected, metric, grain),
+                "total": (
+                    current_order_total
+                    if metric == "orders" else _rounded(selected[metric])
+                ),
+                "breakdown": (
+                    [
+                        {"label": order_channel_labels[name], "value": current_order_counts[name]}
+                        for name in visible_order_channels
+                    ]
+                    if metric == "orders" else breakdown(metric)
+                ),
+                "trend": [] if metric == "orders" else _trend(selected, metric, grain),
                 **(
                     {
                         "previous_total": _rounded(previous_metrics[metric]),
                         "previous_period_label": previous_label,
                         "previous_has_data": previous_has_data,
                     }
-                    if metric in {"zero_rated", "exempted", "taxable", "pnl"} else {}
+                    if metric in {"zero_rated", "exempted", "taxable", "pnl"} else (
+                        {
+                            "previous_total": comparison_order_total,
+                            "previous_period_label": previous_label,
+                            "previous_has_data": comparison_order_total > 0,
+                        }
+                        if metric == "orders" else {}
+                    )
                 ),
             }
             for metric, title, subtitle in card_definitions
         ],
     }
+
+
+@router.get("/kpis")
+def dashboard_kpis(
+    channel: str = "all",
+    grain: str = "monthly",
+    period: str | None = None,
+    year: int | None = None,
+    latest: bool = False,
+    comparison_grain: str | None = None,
+    comparison_period: str | None = None,
+    comparison_year: int | None = None,
+) -> dict[str, object]:
+    """Return cached visual data unless filters or uploaded datasets changed."""
+    cache_key = (
+        _dashboard_data_version(), channel, grain, period, year, latest,
+        comparison_grain, comparison_period, comparison_year,
+    )
+    now = monotonic()
+    with _dashboard_cache_lock:
+        cached = _dashboard_response_cache.get(cache_key)
+        if cached and now - cached[0] < DASHBOARD_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    # Refresh the shared source once before all visual builders run. Cached-row
+    # access after this point is purely in-memory and performs no version query.
+    _dashboard_source_snapshot()
+    result = _build_dashboard_kpis(
+        channel=channel,
+        grain=grain,
+        period=period,
+        year=year,
+        latest=latest,
+        comparison_grain=comparison_grain,
+        comparison_period=comparison_period,
+        comparison_year=comparison_year,
+    )
+    with _dashboard_cache_lock:
+        current_version = cache_key[0]
+        expired_keys = [
+            key for key, (stored_at, _) in _dashboard_response_cache.items()
+            if key[0] != current_version or now - stored_at >= DASHBOARD_CACHE_TTL_SECONDS
+        ]
+        for key in expired_keys:
+            _dashboard_response_cache.pop(key, None)
+        if len(_dashboard_response_cache) >= 32:
+            oldest_key = min(_dashboard_response_cache, key=lambda key: _dashboard_response_cache[key][0])
+            _dashboard_response_cache.pop(oldest_key, None)
+        _dashboard_response_cache[cache_key] = (monotonic(), result)
+    return result

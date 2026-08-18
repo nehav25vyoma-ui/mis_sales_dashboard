@@ -37,6 +37,11 @@ class UploadHistory(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    amazon_rows: Mapped[list["AmazonDatasetRow"]] = relationship(
+        back_populates="upload",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class DSGDatasetRow(Base):
@@ -93,3 +98,23 @@ class DirectSalesDatasetRow(Base):
     row_data: Mapped[dict] = mapped_column(JSON, nullable=False)
 
     upload: Mapped[UploadHistory] = relationship(back_populates="direct_sales_rows")
+
+
+class AmazonDatasetRow(Base):
+    __tablename__ = "amazon_dataset_rows"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    upload_id: Mapped[str] = mapped_column(
+        ForeignKey("upload_history.upload_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source_row_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    product_name: Mapped[str | None] = mapped_column(String(500))
+    category: Mapped[str | None] = mapped_column(String(100))
+    amount: Mapped[str | None] = mapped_column(String(100))
+    currency: Mapped[str | None] = mapped_column(String(30))
+    state: Mapped[str | None] = mapped_column(String(200))
+    row_data: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+    upload: Mapped[UploadHistory] = relationship(back_populates="amazon_rows")

@@ -645,3 +645,172 @@ groups.
 
 Keep monthly data as the single source of truth and derive quarterly/yearly
 aggregations rather than storing separate copies.
+
+
+24. DASHBOARD VALUES STILL NOT UPDATED
+--------------------------------------
+
+Still not updated. The dashboard screenshot shows zero KPI cards while the
+Sales Trend contains sales through July 2026.
+
+
+25. SALES TREND SCREENSHOT MATCH
+--------------------------------
+
+Update the Sales Trend like in the provided screenshot.
+
+
+26. SALES TREND PLAN TOOLTIP
+----------------------------
+
+In the Sales Trend tooltip, add the plan amount along with the sales amount.
+
+
+27. SALES TREND COMPARISON AND CHANNEL FILTER
+---------------------------------------------
+
+Show the sales-versus-plan comparison inside the Sales Trend tooltip and add
+an independent channel filter to the Sales Trend visual.
+
+
+28. DYNAMIC CHANNEL PLANS IN SALES TREND
+----------------------------------------
+
+When a particular channel is filtered, dynamically update the plan using
+these monthly amounts:
+
+- DSG: 1,00,000
+- SFH: 1,00,000
+- Amazon: 1,00,000
+- Direct Sales: 2,00,000
+
+
+29. ACHIEVEMENT COLOR THEORY
+----------------------------
+
+Use color theory correctly for Sales Trend achievement comparisons. Red gives
+a disproportionately negative impression when sales have achieved 94,519, or
+about 95% of plan.
+
+
+30. WEBPAGE LOADING PERFORMANCE
+-------------------------------
+
+The webpage takes too long to load. Identify the cause and fix the loading
+performance.
+
+
+31. DASHBOARD VISUAL RELOAD PERFORMANCE
+---------------------------------------
+
+Dashboard visuals still take too long to load when opening the Dashboard
+button. Improve repeated dashboard loading performance.
+
+
+32. DASHBOARD VISUALS STILL LOAD SLOWLY
+---------------------------------------
+
+Dashboard visuals still take a long time to load. Fix the issue beyond the
+browser-session cache.
+
+
+33. HOW TO FIX DASHBOARD LOADING TIME
+-------------------------------------
+
+How should the remaining dashboard visual loading time be fixed?
+
+
+34. REDUCE VISUAL UPDATE LOADING TIME
+-------------------------------------
+
+How can the longer loading time when updating dashboard visuals be reduced?
+
+
+35. IMPLEMENT LOADING-TIME REDUCTION
+-------------------------------------
+
+Reduce the dashboard loading-time issues.
+
+
+36. FIVE-SECOND DASHBOARD TARGET
+--------------------------------
+
+Dashboard visuals should load in five seconds or less.
+
+
+37. REUSABLE SALES VS PLAN TOOLTIP
+----------------------------------
+
+Build a reusable dark-themed React/TSX tooltip for a Sales vs Plan chart point.
+It must accept period, planValue, salesValue, and an optional locale; calculate
+gap, achievement, and status internally; use neutral Plan and Sales values;
+show a status badge, Plan and Sales rows, capped progress bar with a white edge
+tick and axis labels, and a plain-language above/below-plan verdict. Use Indian
+digit grouping by default and the specified dark, amber, blue, softened-red,
+and green color system.
+
+
+38. KPI CARD ORDER AND HOVER
+----------------------------
+
+Update the MIS Sales Report KPI cards into this order: Total Sales, Books
+Sales, Taxable Sales, Foreign Sales, and Total Orders. Highlight only the KPI
+card being hovered or keyboard-focused, preserve responsive behavior and the
+existing dashboard theme, and do not change any sales calculation logic.
+
+
+39. SHORT CHANNEL DISPLAY NAMES
+-------------------------------
+
+Replace the displayed names “Online Sales (DSG)” with “DSG” and “Website
+Sales (SFH)” with “SFH” throughout the entire dashboard, including KPI cards,
+filters, charts, tables, tooltips, headers, navigation, reports, summaries, and
+dynamically generated text. Do not change data, calculations, or business logic.
+
+
+40. CATEGORY PERFORMANCE TABLE PRESENTATION
+-------------------------------------------
+
+Update only the visual styling and row-order controls for Category Wise
+Performance: severity-scaled Var.% heat-map cells using theme roles, default
+worst-variance-first sorting with Category A-Z option, Total pinned last and
+visually separated, period-column visibility controls, and a divider between
+Current and Comparison groups. Preserve every existing calculation and value.
+
+
+41. VISUAL-ONLY CATEGORY TABLE RESTYLE
+--------------------------------------
+
+Apply the attached presentation specification only to the Category Wise
+Performance table. Preserve its columns, data, calculations, and row order;
+do not change other dashboard visuals or business logic.
+
+
+42. CATEGORY TABLE SORT, CHANNEL FILTER, AND HOVER
+-------------------------------------------------
+
+Add ascending/descending sorting to every applicable Category Wise Performance
+column; add an independent DSG, SFH, Amazon, and Direct Sales channel filter;
+balance responsive column spacing; emphasize Variance % Against Plan; and
+highlight only the individual hovered cell. Preserve calculations and business
+logic.
+
+
+43. CATEGORY TABLE SORT FILTER AND ALIGNMENT
+--------------------------------------------
+
+Match the screenshot by adding a visible Sort filter to Category Wise
+Performance, removing OTT from its channel filter, and distributing Category
+and metric columns evenly without affecting any other visual.
+
+
+38. KPI CARD PLACEMENT
+----------------------
+
+Arrange the KPI cards in this order:
+
+1. Total Sales
+2. Books Sales
+3. Taxable Sales
+4. Foreign Sales
+5. Total Orders
