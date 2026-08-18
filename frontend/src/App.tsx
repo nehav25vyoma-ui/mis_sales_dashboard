@@ -1179,8 +1179,8 @@ function DashboardPage() {
   const [dateEnd, setDateEnd] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  // The All Channels view is the summary view, so expose every KPI breakdown on load.
-  const [expanded, setExpanded] = useState<string | null>(initialFilters.channel === 'all' ? 'all' : null)
+  // Show the KPI detail panels on first load; All Channels also reopens every panel.
+  const [expanded, setExpanded] = useState<string | null>('all')
   const [categoryPeriodView, setCategoryPeriodView] = useState<'both' | 'current' | 'comparison'>('both')
   const [channelPeriodView, setChannelPeriodView] = useState<'both' | 'current' | 'comparison'>('both')
   const [selectedChannelCell, setSelectedChannelCell] = useState<string | null>(null)
@@ -1266,6 +1266,12 @@ function DashboardPage() {
       .finally(() => setCategoryTableLoading(false))
     return () => controller.abort()
   }, [categoryChannel, time, activeYear, comparison, comparisonYear])
+
+  // API data can arrive after the initial render or restore a saved channel filter.
+  // Open every KPI detail panel once the dashboard is ready for viewing.
+  useEffect(() => {
+    if (data) setExpanded('all')
+  }, [data])
 
   const applyFilters = () => {
     useLatestDataPeriod.current = false
@@ -1484,12 +1490,6 @@ function DashboardPage() {
     <div className="summary-period is-comparison"><span>Comparison period</span><div><small>Total actual</small><strong>{number(comparisonTotal)}</strong></div><div><small>Difference</small><strong className={comparisonDifference >= 0 ? 'positive' : 'negative'}>{comparisonDifference >= 0 ? '+' : '−'}{number(Math.abs(comparisonDifference))}</strong></div></div>
   </div>
 
-  const showAllChannelsDashboard = () => {
-    setDashboardView('overview')
-    setDraftChannel('all')
-    setSelected('all')
-    setExpanded('all')
-  }
   if (loading && !data) return <div className="content"><div className="dashboard-loading">Calculating reviewed sales KPIs…</div></div>
   if (data && dashboardView !== 'overview') {
     const pageTitle = dashboardView === 'product' ? 'Product performance' : dashboardView === 'state' ? 'State performance' : 'Customer performance'
@@ -1535,7 +1535,6 @@ function DashboardPage() {
               }}><option value="all">All Channels</option><option value="dsg">DSG</option><option value="sfh">SFH</option><option value="amazon">Amazon</option><option value="direct">Direct Sales</option></select>
               return null
             })}
-            <button className={dashboardView === 'overview' ? 'active' : ''} type="button" onClick={showAllChannelsDashboard}>All channels</button>
             <button className="product-performance-button" type="button" onClick={() => setDashboardView('product')}>Product performance <span aria-hidden="true">→</span></button>
             <button type="button" onClick={() => setDashboardView('state')}>State performance</button>
             <button type="button" onClick={() => setDashboardView('customer')}>Customer performance</button>

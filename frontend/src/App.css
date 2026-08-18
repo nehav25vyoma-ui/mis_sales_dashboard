@@ -204,7 +204,6 @@ select:focus { border-color: #7779dd; box-shadow: 0 0 0 2px #ededff; }
 .date-apply-button { height: 35px; border: 1px solid #5b5cda; border-radius: 6px; padding: 0 14px; color: #fff; background: #5b5cda; font-size: 10px; font-weight: 700; }
 .date-apply-button:disabled { opacity: .45; cursor: not-allowed; }
 .comparison-channels { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; min-width: 0; margin-top: 14px; padding-top: 14px; border-top: 1px solid #eceef3; }
-.comparison-channels .all-channels-select { display: none; }
 [data-theme="dark"] .dashboard-date-filter select, [data-theme="dark"] .dashboard-date-filter input, [data-theme="dark"] .date-clear-button { border-color: #3a4458; color: #e8edf7; background: #252d3d; color-scheme: dark; }
 [data-theme="dark"] .visual-date-filter-row { border-color: #30384a; background: #202838; }
 .dashboard-filters button:disabled { color: #a3a9b5; background: #f3f4f6; border-color: #e5e7eb; cursor: not-allowed; }
