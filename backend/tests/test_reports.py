@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import datetime
 
 import pytest
 
@@ -11,12 +12,13 @@ from app.reports import (
     _append_amazon_summary_sheet,
     _append_direct_sales_summary_sheet,
     _build_direct_sales_overview,
+    _channel_performance_workbook,
     _product_performance_workbook,
     _product_type,
     _summary_workbook,
 )
 from app.database.models import DirectSalesDatasetRow, UploadHistory
-from app.dashboard import _amazon_is_cancelled, _dsg_pnl_amount, _unique_order_count
+from app.dashboard import _amazon_is_cancelled, _direct_amount, _dsg_pnl_amount, _month, _unique_order_count
 from openpyxl import Workbook
 
 
@@ -114,7 +116,15 @@ def test_clean_report_total_matches_rounded_raw_aggregate():
     assert sheet.auto_filter.ref == "A2:G4"
 
 
-def _dsg_summary_row(order, status, product, basic, quantity, shipping, discount, tax):
+def test_month_uses_the_current_row_date_without_identity_cache():
+    row_data = {"Order Date": "2026-04-15"}
+
+    assert _month(row_data, datetime(2026, 1, 1)) == "2026-04"
+    row_data["Order Date"] = "2026-05-15"
+    assert _month(row_data, datetime(2026, 1, 1)) == "2026-05"
+
+
+def _dsg_summary_row(order, status, product, basic, quantity, shipping, discount, tax, order_total=None):
     return SimpleNamespace(
         order_number=order,
         category="Books",
@@ -130,15 +140,16 @@ def _dsg_summary_row(order, status, product, basic, quantity, shipping, discount
             "Order Shipping Amount": shipping,
             "Cart Discount Amount": discount,
             "Order Total Tax Amount": tax,
+            **({"Order Total Amount": order_total} if order_total is not None else {}),
         },
     )
 
 
 def test_dsg_summary_includes_only_completed_and_charges_order_values_once():
     rows = [
-        ("DSG", _dsg_summary_row("ORD-1", "Completed", "Book A", 100, 1, 25, -10, 18), "2026-08"),
-        ("DSG", _dsg_summary_row("ORD-1", "Completed", "Book B", 200, 2, 25, -20, 18), "2026-08"),
-        ("DSG", _dsg_summary_row("ORD-2", "Cancelled", "Book C", 999, 1, 50, -5, 100), "2026-08"),
+        ("DSG", _dsg_summary_row("ORD-1", "Completed", "Book A", 100, 1, 25, 10, 18, 999), "2026-08"),
+        ("DSG", _dsg_summary_row("ORD-1", "Completed", "Book B", 200, 2, 25, 20, 18), "2026-08"),
+        ("DSG", _dsg_summary_row("ORD-2", "Cancelled", "Book C", 999, 1, 50, 5, 100), "2026-08"),
     ]
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -152,10 +163,10 @@ def test_dsg_summary_includes_only_completed_and_charges_order_values_once():
     ]
     assert sheet.max_row == 5  # title, header, two completed rows, grand total
     assert [sheet.cell(3, column).value for column in range(1, 14)] == [
-        1, 2026, "August", "ORD-1", "Books", "Book A", 1.0, 100.0, 25.0, -10.0, 115.0, 18.0, 133.0,
+        1, 2026, "August", "ORD-1", "Books", "Book A", 1.0, 100.0, 25.0, 10.0, 115.0, 18.0, 133.0,
     ]
     assert [sheet.cell(4, column).value for column in range(1, 14)] == [
-        2, 2026, "August", "ORD-1", "Books", "Book B", 2.0, 200.0, 0.0, -20.0, 180.0, 0.0, 180.0,
+        2, 2026, "August", "ORD-1", "Books", "Book B", 2.0, 200.0, 0.0, 20.0, 180.0, 0.0, 180.0,
     ]
 
 
@@ -170,6 +181,21 @@ def test_dsg_pnl_amount_adds_shipping_once_and_discount_per_product_row():
         _dsg_summary_row("ORD-2", "Completed", "Book C", 300, 1, 30, -15, 0),
         charged_orders,
     ) == 315
+
+
+def test_dsg_summary_invoice_value_is_taxable_value_plus_tax():
+    first = _dsg_summary_row("ORD-1", "Completed", "Book A", 100, 1, 25, 0, 18)
+    second = _dsg_summary_row("ORD-1", "Completed", "Book B", 200, 1, 25, 0, 18)
+    first.row_data["Order Total Amount"] = 344
+    second.row_data["Order Total Amount"] = 344
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+
+    _append_dsg_summary_sheet(workbook, [("DSG", first, "2026-08"), ("DSG", second, "2026-08")], "Aug - 26 DSG Sales")
+
+    sheet = workbook["DSG"]
+    assert sheet.cell(3, 13).value == 143
+    assert sheet.cell(4, 13).value == 200
 
 
 def _sfh_summary_row(invoice, currency, course, without_tax, earnings, tax):
@@ -246,6 +272,35 @@ def test_amazon_summary_excludes_cancelled_and_calculates_without_tax_or_discoun
     assert [sheet.cell(4, column).value for column in range(1, 14)] == [
         2, 2026, "August", "AMZ-3", "Books", "Book C", 3.0, 300.0, 0.0, 0, 300.0, 0, 300.0,
     ]
+
+
+def test_amazon_channel_performance_uses_delivered_unique_orders_and_item_price():
+    rows = [
+        ("Amazon", _amazon_summary_row("AMZ-1", "Shipped - Delivered to Buyer", "A", 1, 100, 0), "2026-04"),
+        ("Amazon", _amazon_summary_row("AMZ-1", "Shipped - Delivered to Buyer", "B", 1, 50, 0), "2026-04"),
+        ("Amazon", _amazon_summary_row("AMZ-2", " shipped - delivered to buyer ", "C", 1, 75, 0), "2026-04"),
+        ("Amazon", _amazon_summary_row("AMZ-3", "Cancelled", "D", 1, 999, 0), "2026-04"),
+        ("Amazon", _amazon_summary_row("AMZ-4", "Shipped - Delivered to Buyer", "E", 1, 125, 0), "2026-05"),
+        ("DSG", _dsg_summary_row("DSG-1", "Completed", "Book", 500, 1, 0, 0, 0), "2026-05"),
+    ]
+
+    sheet = _channel_performance_workbook(rows)["Amazon"]
+
+    assert [sheet.cell(2, column).value for column in (3, 4, 5, 6)] == [2, "-", "-", 225]
+    assert [sheet.cell(3, column).value for column in (3, 4, 5, 6)] == [1, -1, -0.5, 125]
+
+
+def test_amazon_channel_performance_handles_zero_previous_orders():
+    rows = [
+        ("Amazon", _amazon_summary_row("", "Shipped - Delivered to Buyer", "A", 1, 100, 0), "2026-04"),
+        ("Amazon", _amazon_summary_row("AMZ-1", "Shipped - Delivered to Buyer", "B", 1, 50, 0), "2026-05"),
+    ]
+
+    sheet = _channel_performance_workbook(rows)["Amazon"]
+
+    assert sheet.cell(2, 3).value == 0
+    assert sheet.cell(3, 4).value == 1
+    assert sheet.cell(3, 5).value == "-"
 
 
 def test_unique_order_count_uses_channel_rules_and_amazon_exclusions():
@@ -346,6 +401,15 @@ def _direct_row(row_id, order, product, amount, quantity, notes=""):
             "Private Notes": notes,
         },
     )
+
+
+def test_direct_sales_amount_excludes_cancelled_invoice_status():
+    active = _direct_row(1, "A", "Active Book", 100, 1)
+    cancelled = _direct_row(2, "B", "Cancelled Book", 250, 1)
+    cancelled.row_data["Status"] = "  Cancelled "
+
+    assert _direct_amount(active) == 100
+    assert _direct_amount(cancelled) == 0
 
 
 def test_direct_sales_overview_reuses_dashboard_mapping_and_reconciles():

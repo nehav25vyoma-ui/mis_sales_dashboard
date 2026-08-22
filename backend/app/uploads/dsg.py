@@ -21,6 +21,7 @@ router = APIRouter(prefix="/api/uploads", tags=["uploads"])
 MAX_FILE_SIZE = 50 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 STANDARD_CATEGORIES = ("Books", "Web Version", "Audio Device", "Pen Drive")
+PRODUCT_REVIEWED_MARKER = "__mis_product_reviewed"
 CATEGORY_MAPPING = {
     "books": "Books",
     "book - paperback": "Books",
@@ -31,8 +32,6 @@ CATEGORY_MAPPING = {
     "pen drive": "Pen Drive",
     "pendrive": "Pen Drive",
 }
-UPLOAD_STORE: dict[str, dict[str, object]] = {}
-
 # Only headers are normalised here. Business values and calculations are left
 # untouched for the review workflow.
 COLUMN_ALIASES = {
@@ -154,10 +153,72 @@ def _review_rows(upload: dict[str, object]) -> list[dict[str, object]]:
 
 
 def _get_upload(upload_id: str) -> dict[str, object]:
-    upload = UPLOAD_STORE.get(upload_id)
-    if upload is None:
-        raise HTTPException(status_code=404, detail="Upload session not found. Please upload the file again.")
-    return upload
+    with SessionLocal() as database:
+        history = database.query(UploadHistory).filter(
+            UploadHistory.upload_id == upload_id,
+            UploadHistory.channel == "DSG",
+            UploadHistory.upload_status == "Reviewing",
+        ).first()
+        if history is None:
+            raise HTTPException(status_code=404, detail="Upload session not found. Please upload the file again.")
+        rows = database.query(DSGDatasetRow).filter_by(upload_id=upload_id).order_by(
+            DSGDatasetRow.source_row_number
+        ).all()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Upload session not found. Please upload the file again.")
+        reviewed_product_rows = {
+            index
+            for index, row in enumerate(rows)
+            if bool(row.row_data.get(PRODUCT_REVIEWED_MARKER))
+        }
+        frame = pd.DataFrame([
+            {
+                key: value
+                for key, value in row.row_data.items()
+                if key != PRODUCT_REVIEWED_MARKER
+            }
+            for row in rows
+        ])
+        frame.index = range(len(frame.index))
+        return {
+            "frame": frame,
+            "resolved_columns": _validate_columns(frame),
+            "file_name": history.file_name,
+            "channel": "DSG",
+            "dataset_hash": history.dataset_hash,
+            "uploaded_at": history.uploaded_at,
+            "uploaded_by": history.uploaded_by,
+            "reviewed_product_rows": reviewed_product_rows,
+            "upload_id": upload_id,
+        }
+
+
+def _save_upload(upload: dict[str, object]) -> None:
+    """Persist the in-review DSG frame so Vercel instances can change safely."""
+    frame = upload["frame"]
+    columns = upload["resolved_columns"]
+    assert isinstance(frame, pd.DataFrame)
+    assert isinstance(columns, dict)
+    reviewed_product_rows = upload.get("reviewed_product_rows", set())
+    assert isinstance(reviewed_product_rows, set)
+    with SessionLocal() as database:
+        database.query(DSGDatasetRow).filter_by(upload_id=str(upload["upload_id"])).delete(
+            synchronize_session=False
+        )
+        for source_number, (row_id, row) in enumerate(frame.iterrows(), start=1):
+            row_data = {str(column): _json_value(row[column]) for column in frame.columns}
+            if int(row_id) in reviewed_product_rows:
+                row_data[PRODUCT_REVIEWED_MARKER] = True
+            database.add(DSGDatasetRow(
+                upload_id=str(upload["upload_id"]),
+                source_row_number=source_number,
+                order_number=str(_json_value(row[columns["order_number"]]) or ""),
+                product_name=str(_json_value(row[columns["product_name"]]) or ""),
+                category=str(_json_value(row[columns["category"]]) or ""),
+                amount=str(_json_value(row[columns["amount"]]) or ""),
+                row_data=row_data,
+            ))
+        database.commit()
 
 
 def _product_key(value: object) -> str:
@@ -265,20 +326,6 @@ async def upload_dsg_dataset(file: UploadFile = File(...)) -> dict[str, object]:
                 status_code=409,
                 detail=f"This DSG dataset was already uploaded. Dataset ID: {duplicate.upload_id}.",
             )
-    active_duplicate = next(
-        (
-            item
-            for item in UPLOAD_STORE.values()
-            if item.get("dataset_hash") == dataset_hash
-        ),
-        None,
-    )
-    if active_duplicate:
-        raise HTTPException(
-            status_code=409,
-            detail="This DSG dataset is already being reviewed. Complete or delete the existing upload first.",
-        )
-
     frame = _read_dataset(content, extension)
     if frame.empty:
         raise HTTPException(status_code=422, detail="The dataset contains no records.")
@@ -291,7 +338,7 @@ async def upload_dsg_dataset(file: UploadFile = File(...)) -> dict[str, object]:
         lambda value: CATEGORY_MAPPING.get(str(value).strip().casefold(), value)
     )
     upload_id = str(uuid4())
-    UPLOAD_STORE[upload_id] = {
+    upload = {
         "frame": frame,
         "resolved_columns": columns,
         "file_name": filename,
@@ -300,9 +347,23 @@ async def upload_dsg_dataset(file: UploadFile = File(...)) -> dict[str, object]:
         "uploaded_at": datetime.now(timezone.utc),
         "uploaded_by": "Admin User",
         "reviewed_product_rows": set(),
+        "upload_id": upload_id,
     }
-    review_rows = _review_rows(UPLOAD_STORE[upload_id])
-    product_groups = _product_groups(UPLOAD_STORE[upload_id])
+    with SessionLocal() as database:
+        database.add(UploadHistory(
+            upload_id=upload_id,
+            dataset_hash=dataset_hash,
+            file_name=filename,
+            channel="DSG",
+            uploaded_at=upload["uploaded_at"],
+            uploaded_by="Admin User",
+            total_records=len(frame.index),
+            upload_status="Reviewing",
+        ))
+        database.commit()
+    _save_upload(upload)
+    review_rows = _review_rows(upload)
+    product_groups = _product_groups(upload)
 
     return {
         "upload_id": upload_id,
@@ -348,6 +409,7 @@ def update_category(upload_id: str, row_id: int, update: CategoryUpdate) -> dict
     if current_category.casefold() == "combo":
         raise HTTPException(status_code=422, detail="Combo records must be split into at least two parts.")
     frame.at[row_id, columns["category"]] = update.category
+    _save_upload(upload)
     rows = _review_rows(upload)
     return {"updated": True, "remaining": len(rows), "completed": not rows}
 
@@ -382,6 +444,7 @@ def split_combo(upload_id: str, row_id: int, update: ComboUpdate) -> dict[str, o
         new_row[columns["category"]] = part.category
         new_row[columns["amount"]] = part.amount
         frame.loc[next_index + offset] = new_row
+    _save_upload(upload)
     rows = _review_rows(upload)
     return {"updated": True, "remaining": len(rows), "completed": not rows}
 
@@ -445,6 +508,7 @@ def update_product_name(
     reviewed_rows = upload.get("reviewed_product_rows")
     assert isinstance(reviewed_rows, set)
     reviewed_rows.update(group_row_ids)
+    _save_upload(upload)
     groups = _product_groups(upload)
     return {
         "updated": True,
@@ -467,32 +531,15 @@ def complete_dsg_upload(upload_id: str) -> dict[str, object]:
     assert isinstance(columns, dict)
 
     with SessionLocal() as database:
-        history = UploadHistory(
-            upload_id=upload_id,
-            dataset_hash=str(upload["dataset_hash"]),
-            file_name=str(upload["file_name"]),
-            channel="DSG",
-            uploaded_at=upload["uploaded_at"],
-            uploaded_by=str(upload["uploaded_by"]),
-            total_records=len(frame.index),
-            upload_status="Completed",
-        )
-        database.add(history)
-        for source_number, (_, row) in enumerate(frame.iterrows(), start=1):
-            database.add(
-                DSGDatasetRow(
-                    upload_id=upload_id,
-                    source_row_number=source_number,
-                    order_number=str(_json_value(row[columns["order_number"]]) or ""),
-                    product_name=str(_json_value(row[columns["product_name"]]) or ""),
-                    category=str(_json_value(row[columns["category"]]) or ""),
-                    amount=str(_json_value(row[columns["amount"]]) or ""),
-                    row_data={
-                        str(column): _json_value(row[column])
-                        for column in frame.columns
-                    },
-                )
-            )
+        history = database.query(UploadHistory).filter_by(upload_id=upload_id, channel="DSG").first()
+        if history is None:
+            raise HTTPException(status_code=404, detail="Upload session not found. Please upload the file again.")
+        history.total_records = len(frame.index)
+        history.upload_status = "Completed"
+        for dataset_row in database.query(DSGDatasetRow).filter_by(upload_id=upload_id).all():
+            row_data = dict(dataset_row.row_data)
+            row_data.pop(PRODUCT_REVIEWED_MARKER, None)
+            dataset_row.row_data = row_data
         try:
             database.commit()
         except IntegrityError as exc:
@@ -507,7 +554,6 @@ def complete_dsg_upload(upload_id: str) -> dict[str, object]:
                 status_code=503,
                 detail="The reviewed dataset could not be saved to PostgreSQL.",
             ) from exc
-    UPLOAD_STORE.pop(upload_id, None)
     return {
         "upload_id": upload_id,
         "file_name": upload["file_name"],

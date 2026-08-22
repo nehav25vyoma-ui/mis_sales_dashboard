@@ -1,6 +1,7 @@
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
+from functools import lru_cache
 from threading import Lock
 from time import monotonic
 from typing import Any
@@ -20,7 +21,8 @@ _dashboard_response_cache: dict[tuple[object, ...], tuple[float, dict[str, objec
 _dashboard_cache_lock = Lock()
 _dashboard_source_cache: dict[str, object] = {}
 _dashboard_source_lock = Lock()
-_month_value_cache: dict[int, str] = {}
+_channel_metrics_cache: dict[str, object] = {}
+_channel_metrics_lock = Lock()
 
 
 def _dashboard_data_version() -> tuple[int, str]:
@@ -51,7 +53,9 @@ def _dashboard_source_snapshot() -> dict[str, object]:
             }
         _dashboard_source_cache.clear()
         _dashboard_source_cache.update(snapshot)
-        _month_value_cache.clear()
+        with _channel_metrics_lock:
+            _channel_metrics_cache.clear()
+        _parsed_month.cache_clear()
         return _dashboard_source_cache
 
 
@@ -178,6 +182,9 @@ def _number(value: object) -> float:
 
 
 def _direct_amount(row: DirectSalesDatasetRow) -> float:
+    status = _row_value(row.row_data, ("status",))
+    if str(status or "").strip().casefold() == "cancelled":
+        return 0.0
     # row_data is authoritative so uploads saved before the dedicated Direct
     # Sales amount mapping also use the correct net-of-tax business value.
     value = _row_value(row.row_data, ("without tax total",))
@@ -303,21 +310,24 @@ def _dsg_pnl_amount(row: DSGDatasetRow, charged_orders: set[str]) -> float:
     return basic_value + shipping + discount
 
 
+@lru_cache(maxsize=8192)
+def _parsed_month(value: object) -> str | None:
+    parsed = pd.to_datetime(value, errors="coerce")
+    return None if pd.isna(parsed) else parsed.strftime("%Y-%m")
+
+
 def _month(data: dict[str, Any], fallback: datetime) -> str:
-    cache_key = id(data)
-    cached = _month_value_cache.get(cache_key)
-    if cached is not None:
-        return cached
     value = _row_value(data, DATE_ALIASES)
     if value is not None:
-        parsed = pd.to_datetime(value, errors="coerce")
-        if not pd.isna(parsed):
-            result = parsed.strftime("%Y-%m")
-            _month_value_cache[cache_key] = result
-            return result
-    result = fallback.strftime("%Y-%m")
-    _month_value_cache[cache_key] = result
-    return result
+        try:
+            parsed_month = _parsed_month(value)
+        except TypeError:
+            # Unexpected non-hashable date values retain the original parsing path.
+            parsed = pd.to_datetime(value, errors="coerce")
+            parsed_month = None if pd.isna(parsed) else parsed.strftime("%Y-%m")
+        if parsed_month is not None:
+            return parsed_month
+    return fallback.strftime("%Y-%m")
 
 
 def _empty_month_metrics() -> defaultdict[str, Any]:
@@ -462,6 +472,12 @@ def _category_actuals(metrics: dict[str, Any]) -> dict[str, float]:
 
 
 def _load_channel_metrics() -> dict[str, dict[str, Any]]:
+    snapshot = _dashboard_source_cache or _dashboard_source_snapshot()
+    version = snapshot["version"]
+    with _channel_metrics_lock:
+        if _channel_metrics_cache.get("version") == version:
+            return _channel_metrics_cache["metrics"]  # type: ignore[return-value]
+
     channels = {
         "dsg": _empty_metrics(),
         "sfh": _empty_metrics(),
@@ -514,6 +530,9 @@ def _load_channel_metrics() -> dict[str, dict[str, Any]]:
                 is_foreign=False,
                 month=_month(row.row_data, uploaded_at),
             )
+    with _channel_metrics_lock:
+        _channel_metrics_cache.clear()
+        _channel_metrics_cache.update({"version": version, "metrics": channels})
     return channels
 
 
