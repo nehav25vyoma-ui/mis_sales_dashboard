@@ -156,6 +156,7 @@ select:focus { border-color: #7779dd; box-shadow: 0 0 0 2px #ededff; }
 .dashboard-subpage-head > button:hover { border-color: #7779dd; background: #f7f7ff; }
 .dashboard-subpage-head h2 { margin: 5px 0 5px; color: #263149; font: 700 24px Manrope, sans-serif; }
 .dashboard-subpage-head p { margin: 0; color: var(--muted); font-size: 11px; }
+.dashboard-subpage-head > div:nth-child(2) { flex: 1 1 auto; min-width: 0; }
 .dashboard-subpage-content { display: grid; grid-template-columns: 1fr; gap: 16px; }
 .dashboard-subpage-content > section { width: 100%; box-sizing: border-box; }
 [data-theme="dark"] .dashboard-subpage-head > button { border-color: #3a4458; color: #c7c8ff; background: #252d3d; }

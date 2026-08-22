@@ -438,6 +438,10 @@ def _append_channel_sheet(
         cell.border = Border(bottom=Side(style="thin", color="1F2937"))
 
 
+def _summary_taxable_value(basic_value: float, shipping: float, discount: float) -> float:
+    return basic_value + shipping - discount
+
+
 def _append_dsg_summary_sheet(workbook: Workbook, rows, label: str) -> None:
     """Build the Summary Report DSG detail sheet using order-level charges once."""
     sheet = workbook.create_sheet("DSG")
@@ -469,7 +473,7 @@ def _append_dsg_summary_sheet(workbook: Workbook, rows, label: str) -> None:
         shipping = _number(_row_value(data, ("order shipping amount",))) if first_order_row else 0.0
         discount = _number(_row_value(data, ("cart discount amount",)))
         total_tax = _number(_row_value(data, ("order total tax amount",))) if first_order_row else 0.0
-        taxable_value = basic_value + shipping + discount
+        taxable_value = _summary_taxable_value(basic_value, shipping, discount)
         sheet.append([
             index,
             year,
@@ -537,7 +541,7 @@ def _append_sfh_summary_sheet(workbook: Workbook, rows, label: str) -> None:
             ("without tax total",) if is_inr else ("earnings",),
         ))
         total_tax = _number(_row_value(data, ("tax",))) if is_inr else 0.0
-        taxable_value = basic_value  # SFH has neither shipping nor discount.
+        taxable_value = _summary_taxable_value(basic_value, 0, 0)
         output_rows.append([
             len(output_rows) + 1,
             year,
@@ -592,7 +596,7 @@ def _append_amazon_summary_sheet(workbook: Workbook, rows, label: str) -> None:
         year, month = _report_year_month(month_key)
         basic_value = _number(_row_value(data, ("item-price", "item price")))
         shipping = _number(_row_value(data, ("shipping-price", "shipping price")))
-        taxable_value = basic_value + shipping
+        taxable_value = _summary_taxable_value(basic_value, shipping, 0)
         sheet.append([
             index,
             year,
@@ -641,13 +645,8 @@ def _append_direct_sales_summary_sheet(workbook: Workbook, rows, label: str) -> 
 
     invoice_totals: dict[str, float] = defaultdict(float)
     for _, row, _ in rows:
-        data = row.row_data
         invoice_key = _order_identifier("Direct Sales", row)
-        invoice_totals[invoice_key] += _number(
-            _row_value(data, ("without tax total",))
-            if _row_value(data, ("without tax total",)) is not None
-            else getattr(row, "amount", None)
-        )
+        invoice_totals[invoice_key] += _direct_amount(row)
 
     for index, (_, row, month_key) in enumerate(rows, 1):
         data = row.row_data
@@ -662,11 +661,7 @@ def _append_direct_sales_summary_sheet(workbook: Workbook, rows, label: str) -> 
         # lines. Keep that allocation in the report so filtering a line does
         # not hide the entire invoice value. Allocate invoice tax by the same
         # ratio; the complete invoice still adds back exactly once.
-        taxable_value = _number(
-            _row_value(data, ("without tax total",))
-            if _row_value(data, ("without tax total",)) is not None
-            else getattr(row, "amount", None)
-        )
+        taxable_value = _direct_amount(row)
         invoice_taxable = invoice_totals.get(invoice_key, 0.0)
         invoice_tax = _number(_row_value(data, ("tax",)))
         total_tax = (
@@ -1032,8 +1027,23 @@ def _channel_performance_workbook(rows) -> Workbook:
         for row_channel, row, month_key in rows:
             if row_channel != channel:
                 continue
-            order_id = _order_identifier(channel, row)
+            if channel == "Amazon":
+                order_status = _row_value(row.row_data, ("order-status", "order status"))
+                if str(order_status or "").strip().casefold() != "shipped - delivered to buyer":
+                    continue
+                order_id = str(
+                    _row_value(row.row_data, ("amazon-order-id", "amazon order id")) or ""
+                ).strip().casefold()
+            else:
+                order_id = _order_identifier(channel, row)
             if order_id:
+                monthly[month_key]["with_tax_by_order"][order_id]
+            if channel == "Amazon":
+                monthly[month_key].setdefault("amazon_with_tax", 0.0)
+                monthly[month_key]["amazon_with_tax"] += _number(
+                    _row_value(row.row_data, ("item-price", "item price"))
+                )
+            elif order_id:
                 monthly[month_key]["with_tax_by_order"][order_id].add(
                     _with_tax_amount(channel, row)
                 )
@@ -1043,15 +1053,20 @@ def _channel_performance_workbook(rows) -> Workbook:
             values = monthly[month_key]
             row_year, row_month = (int(value) for value in month_key.split("-"))
             orders = len(values["with_tax_by_order"])
-            with_tax = whole_number(sum(
-                sum(order_values) for order_values in values["with_tax_by_order"].values()
-            ))
+            with_tax = whole_number(
+                values.get("amazon_with_tax", 0.0)
+                if channel == "Amazon"
+                else sum(sum(order_values) for order_values in values["with_tax_by_order"].values())
+            )
             without_tax = whole_number(values["without_tax"])
             if previous is None:
                 order_variance = order_percent = sales_variance = sales_percent = "-"
             else:
                 order_variance = orders - previous["orders"]
-                order_percent = order_variance / orders if orders else "-"
+                order_percent = (
+                    order_variance / previous["orders"] if previous["orders"]
+                    else "-"
+                ) if channel == "Amazon" else order_variance / orders if orders else "-"
                 sales_variance = without_tax - previous["without_tax"]
                 sales_percent = sales_variance / without_tax if without_tax else "-"
             sheet.append([
