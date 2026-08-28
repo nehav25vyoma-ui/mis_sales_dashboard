@@ -71,6 +71,16 @@ async def upload_amazon_dataset(file: UploadFile = File(...)) -> dict[str, objec
         )
 
     frame = frame.copy()
+    item_prices = pd.to_numeric(
+        frame[resolved["amount"]].astype(str).str.replace(",", "", regex=False),
+        errors="coerce",
+    )
+    frame = frame.loc[item_prices.ne(0) & item_prices.notna()].copy()
+    if frame.empty:
+        raise HTTPException(
+            status_code=422,
+            detail="The Amazon dataset contains no records with a non-zero item-price.",
+        )
     frame.index = range(len(frame.index))
     frame["Category"] = "Books"
     resolved["category"] = "Category"

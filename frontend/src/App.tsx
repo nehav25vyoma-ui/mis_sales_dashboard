@@ -1,11 +1,11 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
 import './App.css'
 
-type ModuleId = 'dashboard' | 'upload' | 'reports' | 'history'
+type ModuleId = 'dashboard' | 'upload' | 'reports' | 'plans' | 'history'
 type UploadState = 'idle' | 'selected' | 'uploading' | 'error'
 type WorkflowPage = 'upload' | 'category' | 'product' | 'saving'
 type UploadChannel = 'DSG' | 'SFH' | 'Amazon' | 'Direct Sales'
-type DashboardView = 'overview' | 'product' | 'state' | 'customer'
+type DashboardView = 'overview' | 'product' | 'state' | 'customer' | 'financial'
 type DashboardPageFilter = { channel: string | null; dateFilterMode: 'date' | 'month' | 'range'; dateStart: string; dateEnd: string }
 
 type ReviewRow = {
@@ -54,6 +54,10 @@ type DashboardData = {
   selected_period: string
   selected_year: number
   available_years: number[]
+  monthly_plans?: Record<string, number>
+  comparison_monthly_plans?: Record<string, number>
+  category_monthly_plans?: Record<string, number>
+  comparison_category_monthly_plans?: Record<string, number>
   category_performance: {
     category: string
     current: { plan: number; actual: number }
@@ -84,6 +88,10 @@ type DashboardData = {
     repeat_rate_delta: number
     repeat_rate_declining: boolean
   }
+  financial_breakdown: Record<string, {
+    basic_value: number; shipping: number; discount: number
+    taxable_value: number; total_tax: number; total_sale: number
+  }>
   state_performance: { state: string; amount: number; orders: number; customers: number }[]
   state_order_details: {
     year: number; month: number; channel: string; order_id: string; category: string
@@ -184,25 +192,25 @@ const quarters = [
   'Q4 (Oct, Nov, Dec)',
 ]
 
-// Covers the full Digital Online group (DSG + SFH + Amazon).
-const TOTAL_SALES_MONTHLY_PLAN = 500000
-const CHANNEL_MONTHLY_PLANS = {
-  digitalOnline: 300000,
-  stallSales: 100000,
-  directSales: 50000,
-  bulkSales: 50000,
-  totalSales: 500000,
-  languageLab: 125000,
-  ott: 200000,
-  grandTotal: 825000,
-}
-const SALES_TREND_MONTHLY_PLANS: Record<string, number> = {
+const DEFAULT_2026_SALES_PLANS: Record<string, number> = {
   DSG: 100000,
   SFH: 100000,
   Amazon: 100000,
   'Direct Sales': 200000,
 }
 
+const CHANNEL_MONTHLY_PLANS = {
+  digitalOnline: 300000,
+  inOffice: 50000,
+  stall: 50000,
+  bulk: 50000,
+  call: 25000,
+  retail: 25000,
+  totalSales: 500000,
+  languageLab: 125000,
+  ott: 200000,
+  grandTotal: 825000,
+}
 function getPlanForGrain(monthlyPlan: number, grain: TimeSelection['grain'], period = '') {
   if (grain === 'monthly') return monthlyPlan * Math.max(period.split(',').filter(Boolean).length, 1)
   if (grain === 'quarterly') return monthlyPlan * 3
@@ -224,6 +232,7 @@ const modules: { id: ModuleId; label: string; icon: string }[] = [
   { id: 'dashboard', label: 'Dashboard', icon: 'grid' },
   { id: 'upload', label: 'Upload center', icon: 'upload' },
   { id: 'reports', label: 'Report center', icon: 'report' },
+  { id: 'plans', label: 'Plan Updation', icon: 'calendar' },
   { id: 'history', label: 'Upload history', icon: 'history' },
 ]
 
@@ -395,7 +404,7 @@ function ReportCenter() {
       const url = URL.createObjectURL(await response.blob())
       const link = document.createElement('a')
       link.href = url
-      link.download = 'direct-sales-overview.csv'
+      link.download = 'direct-sales-overview.xlsx'
       link.click()
       URL.revokeObjectURL(url)
     } catch (reason) {
@@ -405,7 +414,7 @@ function ReportCenter() {
     }
   }
 
-  return <div className="content report-center">
+  return <div className={`content report-center${isDirectOverview ? ' direct-sales-overview-theme' : ''}`}>
     <section className="intro"><div><span className="section-kicker">Reporting & exports</span><h2>Sales Report Center</h2><p>Build monthly or yearly MIS reports and download filtered source data or a presentation-ready Excel workbook.</p></div></section>
     <section className="report-filter-card">
       <div className="report-filter-grid">
@@ -421,14 +430,14 @@ function ReportCenter() {
         <MultiCheckFilter label="Product" options={directOptions.products.map((value) => ({ value, label: value }))} selected={directProducts} onChange={setDirectProducts} />
       </div>}
     </section>
-    {isDirectOverview && <section className="report-preview-card report-export-card">
-      <div className="report-preview-head"><div><span className="section-kicker">Validated CSV export</span><h3>Direct Sales Overview</h3><p>Uses the same Bulk, Retail, Stall, and Language Lab mapping as Channel Wise Performance.</p></div><span className="format-pill">CSV</span></div>
+    {isDirectOverview && <section className="report-preview-card report-export-card direct-overview-card">
+      <div className="report-preview-head"><div><span className="section-kicker">Styled Excel export</span><h3>Direct Sales Overview</h3><p>Provides the detailed In Office, Stall, Bulk, Call, Retail, and Language Lab classification.</p></div><span className="format-pill">XLSX</span></div>
       {directError && <div className="error-message">{directError}</div>}
       {directPreview?.validated && <div className="direct-overview-validation">
         {directOptions?.types.map((type) => <div key={type}><span>{type}</span><strong>{Math.round(directPreview.totals[type] ?? 0).toLocaleString('en-IN')}</strong></div>)}
         <div className="overall"><span>Overall Total</span><strong>{Math.round(directPreview.overall_total).toLocaleString('en-IN')}</strong></div>
       </div>}
-      <div className="report-download-footer"><div><strong>{directPreview?.validated ? 'Reconciled and ready' : directLoading ? 'Validating report…' : 'Select filters to validate'}</strong><span>{directPreview ? `${directPreview.row_count.toLocaleString('en-IN')} unique rows from ${directPreview.source_records.toLocaleString('en-IN')} records.` : 'Download is enabled only after dashboard reconciliation succeeds.'}</span></div><button className="primary-download" disabled={!directPreview?.validated || directLoading} onClick={() => { void downloadDirectOverview() }}>↓ Download CSV</button></div>
+      <div className="report-download-footer"><div><strong>{directPreview?.validated ? 'Reconciled and ready' : directLoading ? 'Validating report…' : 'Select filters to validate'}</strong><span>{directPreview ? `${directPreview.row_count.toLocaleString('en-IN')} unique rows from ${directPreview.source_records.toLocaleString('en-IN')} records.` : 'Download is enabled only after dashboard reconciliation succeeds.'}</span></div><button className="primary-download" disabled={!directPreview?.validated || directLoading} onClick={() => { void downloadDirectOverview() }}>↓ Download Excel</button></div>
     </section>}
     {!isDirectOverview && <section className="report-preview-card report-export-card">
       <div className="report-preview-head"><div><span className="section-kicker">Excel export</span><h3>{reportNames[reportType]}</h3><p>{periodLabel} · The requested report formatting will be applied inside the downloaded Excel file.</p></div><span className="format-pill">XLSX</span></div>
@@ -535,12 +544,12 @@ export function SalesPlanTooltip({ period, planValue, salesValue, locale = 'en-I
   </div>
 }
 
-function SalesTrendChart({ trend, loading, monthlyPlans }: { trend: DashboardData['sales_trend']; loading: boolean; monthlyPlans: Record<string, number> }) {
+function SalesTrendChart({ trend, loading, monthlyPlans, allMonthlyPlan, initialChannel = 'all' }: { trend: DashboardData['sales_trend']; loading: boolean; monthlyPlans: Record<string, number>; allMonthlyPlan?: number; initialChannel?: string }) {
   const [grouping, setGrouping] = useState<'month' | 'quarter' | 'year'>('month')
-  const [trendChannel, setTrendChannel] = useState('all')
+  const [trendChannel, setTrendChannel] = useState(initialChannel)
   const [activePoint, setActivePoint] = useState<number | null>(null)
   const selectedMonthlyPlan = trendChannel === 'all'
-    ? Object.values(monthlyPlans).reduce((sum, plan) => sum + plan, 0)
+    ? (allMonthlyPlan ?? Object.values(monthlyPlans).reduce((sum, plan) => sum + plan, 0))
     : (monthlyPlans[trendChannel] ?? 0)
   const grouped = (() => {
     const values = new Map<string, { label: string; value: number; plan: number; breakdown: Record<string, number> }>()
@@ -852,9 +861,10 @@ function ProductRankings({
     const maximum = Math.max(...items.map((item) => item.amount), 1)
     return items.length ? <div className={`product-rank-items ${tone}`} role="list" aria-label={`${tone === 'top' ? 'Top 5 highest' : 'Bottom 5 lowest'} product sales`}>{items.map((item, index) => {
       const parts = productParts(item.name)
-      return <div className="product-rank-row" role="listitem" key={`${item.name}-${index}`}>
+      const isChannelTop = tone === 'top' && index === 0
+      return <div className={`product-rank-row ${isChannelTop ? 'is-channel-top' : ''}`} role="listitem" aria-label={isChannelTop ? `Top product by channel: ${item.name}, ${money(item.amount)}` : undefined} key={`${item.name}-${index}`}>
         <span className="product-rank-number">{index + 1}</span>
-        <span className="product-rank-name" title={item.name}><span>{parts.title}</span>{parts.sku && <small>· {parts.sku}</small>}</span>
+        <span className="product-rank-name" title={item.name}><span>{parts.title}</span>{parts.sku && <small>· {parts.sku}</small>}{isChannelTop && <em>Top product</em>}</span>
         <strong className={tone}>{money(item.amount)}</strong>
         <span className="product-magnitude-track" aria-hidden="true"><i style={{ width: `${Math.max((item.amount / maximum) * 100, item.amount ? 2 : 0)}%` }} /></span>
       </div>
@@ -973,6 +983,30 @@ function CustomersByEmail({
     </div>
     {data.total_customers ? <div className="customer-split-bar" aria-label={`${Math.round(data.unique_percent)}% new customers and ${Math.round(data.repeat_percent)}% returning customers`}><span className="new" style={{ width: `${data.unique_percent}%` }}>New · {data.unique_customers.toLocaleString('en-IN')} · {Math.round(data.unique_percent)}%</span><span className="returning" style={{ width: `${data.repeat_percent}%` }}>{data.repeat_customers.toLocaleString('en-IN')} · {Math.round(data.repeat_percent)}%</span></div> : <div className="detail-empty">No customer data available</div>}
     {tableOpen && <div className="customer-orders"><div className="customer-orders-head"><strong>{cohort === 'all' ? 'All identified customers' : cohort === 'new' ? 'New customers' : 'Returning customers'}</strong><label>Channel <select value={orderChannel} onChange={(event) => setOrderChannel(event.target.value)}>{DASHBOARD_RECORD_CHANNEL_OPTIONS.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label><label>Category <select value={orderCategory} onChange={(event) => setOrderCategory(event.target.value)}><option value="all">All categories</option>{orderCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select></label><button type="button" disabled={!orders.length} onClick={downloadCustomerOrders}>↓ Download CSV</button><button type="button" onClick={() => setTableOpen(false)}>Close</button></div><div className="customer-orders-date-filter">{dateFilter}</div><div className="customer-table-kpis"><div><span>Total sales</span><strong>{money(cohortSales)}</strong></div><div><span>Total orders</span><strong>{cohortOrders.toLocaleString('en-IN')}</strong></div></div><table><thead><tr><th>Year</th><th>Month</th><th>Email ID</th><th>Category</th><th>Description</th><th>Qty</th><th>Sales</th></tr></thead><tbody>{orders.map((row, index) => <tr key={`${row.order_id}-${index}`}><td>{row.year}</td><td>{row.month}</td><td>{row.email}</td><td>{row.category}</td><td>{row.description}</td><td>{row.quantity}</td><td>{row.sales.toLocaleString('en-IN')}</td></tr>)}</tbody></table></div>}
+  </section>
+}
+
+function FinancialBreakdown({ data, loading, channel, onChannelChange, dateFilter }: { data: DashboardData['financial_breakdown']; loading: boolean; channel: string; onChannelChange: (channel: string) => void; dateFilter: React.ReactNode }) {
+  const channelNames: Record<string, string> = { dsg: 'DSG', sfh: 'SFH', amazon: 'Amazon', direct: 'Direct Sales' }
+  const channels = channel === 'all' ? ['DSG', 'SFH', 'Amazon', 'Direct Sales'] : [channelNames[channel]].filter(Boolean)
+  const formatValue = (value: number) => value === 0 ? '–' : Math.round(value).toLocaleString('en-IN')
+  const rows = [
+    { key: 'basic_value', label: 'Basic value' },
+    { key: 'shipping', label: 'Shipping' },
+    { key: 'discount', label: 'Discount' },
+    { key: 'taxable_value', label: 'Taxable value' },
+    { key: 'total_tax', label: 'Total tax' },
+    { key: 'total_sale', label: 'Total sales' },
+  ] as const
+  return <section className={`financial-breakdown-card ${loading ? 'is-loading' : ''}`}>
+    <div className="financial-breakdown-head"><div><h3>Financial breakdown</h3><p>Financial values use the same channel rules as the Summary report.</p></div></div>
+    <div className="financial-breakdown-filters"><label><span>Channel</span><select value={channel} onChange={(event) => onChannelChange(event.target.value)}>{DASHBOARD_CHANNEL_OPTIONS.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>{dateFilter}</div>
+    <div className="financial-breakdown-wrap"><table className="financial-breakdown-table"><thead><tr><th>Particulars</th>{channels.map((channel) => <th key={channel}>{channel}</th>)}<th>Total</th></tr></thead><tbody>{rows.map((row) => {
+      const total = channels.reduce((sum, channel) => sum + Number(data[channel]?.[row.key] ?? 0), 0)
+      const showBars = row.key === 'basic_value' || row.key === 'taxable_value'
+      const magnitude = Math.max(channels.reduce((sum, channel) => sum + Math.abs(Number(data[channel]?.[row.key] ?? 0)), 0), 1)
+      return <tr className={row.key === 'total_sale' ? 'financial-total-row' : ''} key={row.key}><th>{row.label}</th>{channels.map((channel) => { const value = Number(data[channel]?.[row.key] ?? 0); const share = Math.abs(value) / magnitude * 100; return <td className={row.key === 'discount' && value < 0 ? 'negative' : ''} key={channel}><span>{formatValue(value)}</span>{showBars && value !== 0 && <i className="financial-value-track" aria-hidden="true"><i className="financial-value-bar" style={{ width: `${share}%` }} /></i>}</td> })}<td className={row.key === 'discount' && total < 0 ? 'negative' : ''}><span>{formatValue(total)}</span></td></tr>
+    })}</tbody></table></div>
   </section>
 }
 
@@ -1177,6 +1211,7 @@ function DashboardPage() {
     product: { channel: null, dateFilterMode: 'range', dateStart: '', dateEnd: '' },
     state: { channel: null, dateFilterMode: 'range', dateStart: '', dateEnd: '' },
     customer: { channel: null, dateFilterMode: 'range', dateStart: '', dateEnd: '' },
+    financial: { channel: null, dateFilterMode: 'range', dateStart: '', dateEnd: '' },
   })
   const { dateFilterMode, dateStart, dateEnd } = pageFilters[dashboardView]
   const updatePageFilter = (change: Partial<DashboardPageFilter>) => setPageFilters((current) => ({
@@ -1194,6 +1229,10 @@ function DashboardPage() {
   const [expanded, setExpanded] = useState<string | null>('all')
   const [categoryPeriodView, setCategoryPeriodView] = useState<'both' | 'current' | 'comparison'>('both')
   const [channelPeriodView, setChannelPeriodView] = useState<'both' | 'current' | 'comparison'>('both')
+  const [categoryChannel, setCategoryChannel] = useState(initialFilters.channel)
+  const [categorySalesChannel, setCategorySalesChannel] = useState(initialFilters.channel)
+  const [categoryTableData, setCategoryTableData] = useState<DashboardData | null>(null)
+  const [categorySalesData, setCategorySalesData] = useState<DashboardData | null>(null)
   const [selectedChannelCell, setSelectedChannelCell] = useState<string | null>(null)
   const [categorySort, setCategorySort] = useState<{ key: string; direction: 'asc' | 'desc' }>({ key: 'category', direction: 'asc' })
   const useLatestDataPeriod = useRef(shouldUseLatestDashboardPeriod(initialYear, initialMonth))
@@ -1207,6 +1246,7 @@ function DashboardPage() {
     }
     let active = true
     const query = new URLSearchParams({ channel: globalChannel, grain: time.grain })
+    query.set('view', 'overview')
     if (time.period) query.set('period', time.period)
     query.set('year', String(activeYear))
     query.set('comparison_grain', comparison.grain)
@@ -1238,6 +1278,25 @@ function DashboardPage() {
       .then((result: DashboardData) => {
         if (active) {
           dashboardResponseCache.set(requestUrl, { data: result, storedAt: Date.now() })
+          if (!result.available_years.includes(result.selected_year)) {
+            const fallbackYear = result.available_years[0] ?? initialYear
+            const fallbackTime = time.grain === 'yearly' ? { ...time, period: String(fallbackYear) } : time
+            const fallbackFilters = {
+              channel: globalChannel,
+              time: fallbackTime,
+              year: fallbackYear,
+              comparison,
+              comparisonYear,
+            }
+            dashboardResponseCache.delete(requestUrl)
+            localStorage.setItem(DASHBOARD_FILTERS_KEY, JSON.stringify(fallbackFilters))
+            setTime(fallbackTime)
+            setActiveYear(fallbackYear)
+            setDraftTime(fallbackTime)
+            setDraftYear(fallbackYear)
+            setLoading(true)
+            return
+          }
           if (useLatestDataPeriod.current && time.grain === 'monthly') {
             useLatestDataPeriod.current = false
             const latestYear = result.selected_year
@@ -1267,6 +1326,7 @@ function DashboardPage() {
     let active = true
     const query = new URLSearchParams({
       channel: effectiveChannel,
+      view: detailView,
       grain: time.grain,
       period: time.period,
       year: String(activeYear),
@@ -1298,6 +1358,58 @@ function DashboardPage() {
       .finally(() => { if (active) setDetailLoading(false) })
     return () => { active = false }
   }, [detailView, effectiveChannel, time, activeYear, comparison, comparisonYear])
+
+  useEffect(() => {
+    if (categoryChannel === globalChannel) return
+    let active = true
+    const query = new URLSearchParams({
+      view: 'overview', channel: categoryChannel, grain: time.grain, period: time.period,
+      year: String(activeYear), comparison_grain: comparison.grain,
+      comparison_period: comparison.period, comparison_year: String(comparisonYear),
+    })
+    const requestUrl = `/api/dashboard/kpis?${query}`
+    const cached = dashboardResponseCache.get(requestUrl)
+    if (cached && Date.now() - cached.storedAt < DASHBOARD_CACHE_TTL_MS) {
+      setCategoryTableData(cached.data)
+      return
+    }
+    fetch(requestUrl).then(async (response) => {
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail ?? 'Unable to load Category Wise Performance.')
+      return result as DashboardData
+    }).then((result) => {
+      if (!active) return
+      dashboardResponseCache.set(requestUrl, { data: result, storedAt: Date.now() })
+      setCategoryTableData(result)
+    }).catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : 'Unable to load Category Wise Performance.') })
+    return () => { active = false }
+  }, [categoryChannel, globalChannel, time, activeYear, comparison, comparisonYear])
+
+  useEffect(() => {
+    if (categorySalesChannel === globalChannel) return
+    let active = true
+    const query = new URLSearchParams({
+      view: 'overview', channel: categorySalesChannel, grain: time.grain, period: time.period,
+      year: String(activeYear), comparison_grain: comparison.grain,
+      comparison_period: comparison.period, comparison_year: String(comparisonYear),
+    })
+    const requestUrl = `/api/dashboard/kpis?${query}`
+    const cached = dashboardResponseCache.get(requestUrl)
+    if (cached && Date.now() - cached.storedAt < DASHBOARD_CACHE_TTL_MS) {
+      setCategorySalesData(cached.data)
+      return
+    }
+    fetch(requestUrl).then(async (response) => {
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail ?? 'Unable to load Category Wise Sales.')
+      return result as DashboardData
+    }).then((result) => {
+      if (!active) return
+      dashboardResponseCache.set(requestUrl, { data: result, storedAt: Date.now() })
+      setCategorySalesData(result)
+    }).catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : 'Unable to load Category Wise Sales.') })
+    return () => { active = false }
+  }, [categorySalesChannel, globalChannel, time, activeYear, comparison, comparisonYear])
 
   // API data can arrive after the initial render or restore a saved channel filter.
   // Open every KPI detail panel once the dashboard is ready for viewing.
@@ -1375,7 +1487,8 @@ function DashboardPage() {
     data?.channel_wise_performance[period][channel] ?? 0
   const authoritativeCurrentTotal = Math.round(channelActual('current', 'Total Sales'))
   const authoritativeComparisonTotal = Math.round(channelActual('comparison', 'Total Sales'))
-  const categorySource = data
+  const categorySource = categoryChannel === globalChannel ? data : categoryTableData
+  const categorySalesSource = categorySalesChannel === globalChannel ? data : categorySalesData
   const categorySourceCurrentTotal = Math.round(categorySource?.channel_wise_performance.current['Total Sales'] ?? 0)
   const categorySourceComparisonTotal = Math.round(categorySource?.channel_wise_performance.comparison['Total Sales'] ?? 0)
   const categoryCurrentActuals = reconciledWholeValues(
@@ -1391,6 +1504,15 @@ function DashboardPage() {
     current: { ...row.current, actual: categoryCurrentActuals[index] },
     comparison: { ...row.comparison, actual: categoryComparisonActuals[index] },
   })) ?? []
+  const categorySalesCurrentTotal = Math.round(categorySalesSource?.channel_wise_performance.current['Total Sales'] ?? 0)
+  const categorySalesComparisonTotal = Math.round(categorySalesSource?.channel_wise_performance.comparison['Total Sales'] ?? 0)
+  const categorySalesCurrentActuals = reconciledWholeValues(categorySalesSource?.category_performance.map((row) => row.current.actual) ?? [], categorySalesCurrentTotal)
+  const categorySalesComparisonActuals = reconciledWholeValues(categorySalesSource?.category_performance.map((row) => row.comparison.actual) ?? [], categorySalesComparisonTotal)
+  const categorySalesPerformance = categorySalesSource?.category_performance.map((row, index) => ({
+    ...row,
+    current: { ...row.current, actual: categorySalesCurrentActuals[index] },
+    comparison: { ...row.comparison, actual: categorySalesComparisonActuals[index] },
+  })) ?? []
   const categoryCurrentPlanTotal = categoryPerformance.reduce((sum, row) => sum + Math.round(row.current.plan), 0)
   const categoryComparisonPlanTotal = categoryPerformance.reduce((sum, row) => sum + Math.round(row.comparison.plan), 0)
   const categoryCurrentDifference = variance(categorySourceCurrentTotal, categoryCurrentPlanTotal)
@@ -1403,14 +1525,18 @@ function DashboardPage() {
   })
   const toggleCategorySort = (key: string) => setCategorySort((current) => ({ key, direction: current.key === key && current.direction === 'asc' ? 'desc' : 'asc' }))
   const varianceHeatClass = (value: number) => `variance-heat ${value > 100 ? 'over-100' : value >= 0 ? 'above' : value >= -25 ? 'miss-25' : value >= -50 ? 'miss-50' : value >= -75 ? 'miss-75' : 'miss-100'}`
+  const currentPerformancePlan = (channel: string, fallback: number) => data?.monthly_plans?.[channel] ?? (activeYear === 2026 ? fallback : 0)
+  const comparisonPerformancePlan = (channel: string, fallback: number) => data?.comparison_monthly_plans?.[channel] ?? (comparisonYear === 2026 ? fallback : 0)
   const coreChannels = [
-    { channel: 'Digital Online', monthlyPlan: CHANNEL_MONTHLY_PLANS.digitalOnline },
-    { channel: 'Stall Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.stallSales },
-    { channel: 'Direct Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.directSales },
-    { channel: 'Bulk Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.bulkSales },
+    { channel: 'Digital Online', currentMonthlyPlan: currentPerformancePlan('Digital Online', CHANNEL_MONTHLY_PLANS.digitalOnline), comparisonMonthlyPlan: comparisonPerformancePlan('Digital Online', CHANNEL_MONTHLY_PLANS.digitalOnline) },
+    { channel: 'In Office', currentMonthlyPlan: currentPerformancePlan('In Office', CHANNEL_MONTHLY_PLANS.inOffice), comparisonMonthlyPlan: comparisonPerformancePlan('In Office', CHANNEL_MONTHLY_PLANS.inOffice) },
+    { channel: 'Stall', currentMonthlyPlan: currentPerformancePlan('Stall', CHANNEL_MONTHLY_PLANS.stall), comparisonMonthlyPlan: comparisonPerformancePlan('Stall', CHANNEL_MONTHLY_PLANS.stall) },
+    { channel: 'Bulk', currentMonthlyPlan: currentPerformancePlan('Bulk', CHANNEL_MONTHLY_PLANS.bulk), comparisonMonthlyPlan: comparisonPerformancePlan('Bulk', CHANNEL_MONTHLY_PLANS.bulk) },
+    { channel: 'Call', currentMonthlyPlan: currentPerformancePlan('Call', CHANNEL_MONTHLY_PLANS.call), comparisonMonthlyPlan: comparisonPerformancePlan('Call', CHANNEL_MONTHLY_PLANS.call) },
+    { channel: 'Retail', currentMonthlyPlan: currentPerformancePlan('Retail', CHANNEL_MONTHLY_PLANS.retail), comparisonMonthlyPlan: comparisonPerformancePlan('Retail', CHANNEL_MONTHLY_PLANS.retail) },
   ]
   const reconciledChannelActuals = (period: 'current' | 'comparison', total: number) => {
-    const directNames = ['Stall Sales', 'Direct Sales', 'Bulk Sales']
+    const directNames = ['In Office', 'Stall', 'Bulk', 'Call', 'Retail']
     const directRaw = directNames.map((channel) => channelActual(period, channel))
     let directActuals = reconciledWholeValues(
       directRaw,
@@ -1425,17 +1551,24 @@ function DashboardPage() {
   }
   const currentChannelActuals = reconciledChannelActuals('current', authoritativeCurrentTotal)
   const comparisonChannelActuals = reconciledChannelActuals('comparison', authoritativeComparisonTotal)
+  const currentActiveMonthlyPlan = coreChannels.reduce((sum, row) => sum + row.currentMonthlyPlan, 0)
+  const comparisonActiveMonthlyPlan = coreChannels.reduce((sum, row) => sum + row.comparisonMonthlyPlan, 0)
+  const currentLanguageLabPlan = currentPerformancePlan('Language Lab', CHANNEL_MONTHLY_PLANS.languageLab)
+  const comparisonLanguageLabPlan = comparisonPerformancePlan('Language Lab', CHANNEL_MONTHLY_PLANS.languageLab)
+  const currentOttPlan = currentPerformancePlan('OTT', CHANNEL_MONTHLY_PLANS.ott)
+  const comparisonOttPlan = comparisonPerformancePlan('OTT', CHANNEL_MONTHLY_PLANS.ott)
   const channelPerformance = [
     ...coreChannels.map((row, index) => ({ ...row, currentActual: currentChannelActuals[index], comparisonActual: comparisonChannelActuals[index] })),
-    { channel: 'Total Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.totalSales, currentActual: authoritativeCurrentTotal, comparisonActual: authoritativeComparisonTotal },
-    { channel: 'Language Lab', monthlyPlan: CHANNEL_MONTHLY_PLANS.languageLab, currentActual: channelActual('current', 'Language Lab'), comparisonActual: channelActual('comparison', 'Language Lab') },
-    { channel: 'OTT', monthlyPlan: CHANNEL_MONTHLY_PLANS.ott, currentActual: channelActual('current', 'OTT'), comparisonActual: channelActual('comparison', 'OTT') },
-    { channel: 'Grand Total Sales', monthlyPlan: CHANNEL_MONTHLY_PLANS.grandTotal, currentActual: Math.round(channelActual('current', 'Grand Total Sales')), comparisonActual: Math.round(channelActual('comparison', 'Grand Total Sales')) },
+    { channel: 'Total Sales', currentMonthlyPlan: currentActiveMonthlyPlan, comparisonMonthlyPlan: comparisonActiveMonthlyPlan, currentActual: authoritativeCurrentTotal, comparisonActual: authoritativeComparisonTotal },
+    { channel: 'Language Lab', currentMonthlyPlan: currentLanguageLabPlan, comparisonMonthlyPlan: comparisonLanguageLabPlan, currentActual: channelActual('current', 'Language Lab'), comparisonActual: channelActual('comparison', 'Language Lab') },
+    { channel: 'OTT', currentMonthlyPlan: currentOttPlan, comparisonMonthlyPlan: comparisonOttPlan, currentActual: channelActual('current', 'OTT'), comparisonActual: channelActual('comparison', 'OTT') },
+    { channel: 'Grand Total Sales', currentMonthlyPlan: currentActiveMonthlyPlan + currentLanguageLabPlan + currentOttPlan, comparisonMonthlyPlan: comparisonActiveMonthlyPlan + comparisonLanguageLabPlan + comparisonOttPlan, currentActual: Math.round(channelActual('current', 'Grand Total Sales')), comparisonActual: Math.round(channelActual('comparison', 'Grand Total Sales')) },
   ]
-  const channelCurrentPlanTotal = CHANNEL_MONTHLY_PLANS.grandTotal * currentPlanMonths
-  const channelComparisonPlanTotal = CHANNEL_MONTHLY_PLANS.grandTotal * comparisonPlanMonths
-  const channelCurrentActualTotal = channelPerformance[7].currentActual
-  const channelComparisonActualTotal = channelPerformance[7].comparisonActual
+  const grandTotalPerformance = channelPerformance[channelPerformance.length - 1]
+  const channelCurrentPlanTotal = grandTotalPerformance.currentMonthlyPlan * currentPlanMonths
+  const channelComparisonPlanTotal = grandTotalPerformance.comparisonMonthlyPlan * comparisonPlanMonths
+  const channelCurrentActualTotal = grandTotalPerformance.currentActual
+  const channelComparisonActualTotal = grandTotalPerformance.comparisonActual
   const channelVarianceClass = (value: number) => `channel-variance-percent ${value > 100 ? 'over-100' : value >= 0 ? 'above' : value >= -25 ? 'miss-25' : value >= -50 ? 'miss-50' : value >= -75 ? 'miss-75' : 'miss-100'}`
   const channelCellProps = (key: string, className = '') => ({
     className: `${className}${selectedChannelCell === key ? ' is-selected' : ''}`.trim(),
@@ -1447,12 +1580,12 @@ function DashboardPage() {
 
   const activeCurrentSum = currentChannelActuals.reduce((sum, value) => sum + value, 0)
   const activeComparisonSum = comparisonChannelActuals.reduce((sum, value) => sum + value, 0)
-  const subtotalPlan = coreChannels.reduce((sum, row) => sum + row.monthlyPlan, 0)
-  const inactivePlan = CHANNEL_MONTHLY_PLANS.languageLab + CHANNEL_MONTHLY_PLANS.ott
+  const subtotalPlan = currentActiveMonthlyPlan
+  const inactivePlan = currentLanguageLabPlan + currentOttPlan
   useEffect(() => {
     if (activeCurrentSum !== authoritativeCurrentTotal) console.warn(`Channel performance mismatch: current subtotal is ${authoritativeCurrentTotal}, expected ${activeCurrentSum}.`)
     if (activeComparisonSum !== authoritativeComparisonTotal) console.warn(`Channel performance mismatch: comparison subtotal is ${authoritativeComparisonTotal}, expected ${activeComparisonSum}.`)
-    if (subtotalPlan + inactivePlan !== CHANNEL_MONTHLY_PLANS.grandTotal) console.warn('Channel performance mismatch: grand total plan does not equal subtotal plan plus no-activity plans.')
+    if (subtotalPlan + inactivePlan !== grandTotalPerformance.currentMonthlyPlan) console.warn('Channel performance mismatch: grand total plan does not equal subtotal plan plus no-activity plans.')
   }, [activeCurrentSum, activeComparisonSum, authoritativeCurrentTotal, authoritativeComparisonTotal, subtotalPlan, inactivePlan])
   const performanceHeaders = [
     'Name',
@@ -1486,8 +1619,8 @@ function DashboardPage() {
     `channel-wise-performance-${globalChannel}-${time.grain}-${time.period}.csv`,
     performanceHeaders,
     channelPerformance.map((row) => {
-      const currentPlan = row.monthlyPlan * currentPlanMonths
-      const comparisonPlan = row.monthlyPlan * comparisonPlanMonths
+      const currentPlan = row.currentMonthlyPlan * currentPlanMonths
+      const comparisonPlan = row.comparisonMonthlyPlan * comparisonPlanMonths
       return [
         row.channel,
         number(currentPlan), number(row.currentActual), number(variance(row.currentActual, currentPlan)), reportPercentage(variancePercent(row.currentActual, currentPlan)),
@@ -1528,7 +1661,10 @@ function DashboardPage() {
       product: { ...current.product, channel: null },
       state: { ...current.state, channel: null },
       customer: { ...current.customer, channel: null },
+      financial: { ...current.financial, channel: null },
     }))
+    setCategoryChannel(channel)
+    setCategorySalesChannel(channel)
     const overview = overviewFilters.current
     localStorage.setItem(DASHBOARD_FILTERS_KEY, JSON.stringify({
       channel,
@@ -1538,12 +1674,17 @@ function DashboardPage() {
       comparisonYear: overview?.comparisonYear ?? comparisonYear,
     }))
   }
-  const categoryChannel = globalChannel
-  const setCategoryChannel = setGlobalChannel
   const categoryTableLoading = false
   const setPageChannel = (view: Exclude<DashboardView, 'overview'>, channel: string) => {
     setDetailLoading(true)
     setPageFilters((current) => ({ ...current, [view]: { ...current[view], channel } }))
+  }
+  const setCustomerPageChannel = (channel: string) => {
+    if (channel === 'amazon') {
+      window.alert('No customer performance details available for Amazon.')
+      return
+    }
+    setPageChannel('customer', channel)
   }
   const renderPageChannelFilter = (view: Exclude<DashboardView, 'overview'>) => <label><span>Channel</span><select value={pageFilters[view].channel ?? globalChannel} onChange={(event) => setPageChannel(view, event.target.value)}>{DASHBOARD_CHANNEL_OPTIONS.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>
   const renderStateFilters = () => <div className="state-visual-filters"><div className="product-detail-controls">{renderPageChannelFilter('state')}</div>{renderDateRangeFilter()}</div>
@@ -1553,6 +1694,11 @@ function DashboardPage() {
   </div>
 
   const openDashboardView = (view: Exclude<DashboardView, 'overview'>) => {
+    if (view === 'customer' && globalChannel === 'amazon') {
+      window.alert('No customer performance details available for Amazon.')
+      return
+    }
+    setDetailLoading(true)
     overviewFilters.current = {
       channel: globalChannel,
       time: { ...time },
@@ -1564,6 +1710,7 @@ function DashboardPage() {
   }
 
   const backToDashboard = () => {
+    const leavingView = dashboardView
     const saved = overviewFilters.current
     if (saved) {
       setLoading(true)
@@ -1585,26 +1732,49 @@ function DashboardPage() {
       }))
       overviewFilters.current = null
     }
+    if (leavingView !== 'overview') {
+      setPageFilters((current) => ({
+        ...current,
+        [leavingView]: { channel: null, dateFilterMode: 'range', dateStart: '', dateEnd: '' },
+      }))
+      setCategoryChannel(globalChannel)
+      setCategorySalesChannel(globalChannel)
+    }
     setDashboardView('overview')
   }
 
   const storedDetailData = detailView ? detailData[detailView] : undefined
   const pageData = detailView
-    ? storedDetailData?.selected_channel === effectiveChannel ? storedDetailData : effectiveChannel === globalChannel ? data : null
+    ? storedDetailData?.selected_channel === effectiveChannel ? storedDetailData : null
     : data
-  if ((loading || detailLoading) && !pageData) return <div className="content"><div className="dashboard-loading">Calculating reviewed sales KPIs…</div></div>
+  if ((detailView || loading || detailLoading) && !pageData) return <div className="content"><div className="dashboard-loading">Calculating reviewed sales KPIs…</div></div>
   if (pageData && dashboardView !== 'overview') {
-    const pageTitle = dashboardView === 'product' ? 'Product performance' : dashboardView === 'state' ? 'State performance' : 'Customer performance'
+    const pageTitle = dashboardView === 'product' ? 'Product performance' : dashboardView === 'state' ? 'State performance' : dashboardView === 'customer' ? 'Customer performance' : 'Financial breakdown'
     return <div className="content dashboard-page dashboard-subpage">
-      <section className="dashboard-subpage-head"><button type="button" onClick={backToDashboard}>← Back to dashboard</button><div><span className="section-kicker">Performance detail</span><h2>{pageTitle}</h2><p>Page filters are independent; Channel applies globally.</p></div></section>
+      <section className="dashboard-subpage-head"><button type="button" onClick={backToDashboard}>← Back to dashboard</button><div><span className="section-kicker">Performance detail</span><h2>{pageTitle}</h2><p>This page inherits the global filter; changes made here stay on this page.</p></div></section>
       {error && <div className="error-message dashboard-error"><Icon name="info" size={18} /><span>{error}</span></div>}
       <div className="dashboard-subpage-content">
         {dashboardView === 'product' && <ProductRankings data={pageData.product_performance} loading={detailLoading} channel={effectiveChannel} onChannelChange={(channel) => setPageChannel('product', channel)} dateFilter={renderDateRangeFilter()} />}
         {dashboardView === 'state' && <StateWisePerformance rows={pageData.state_performance} orderDetails={pageData.state_order_details ?? []} loading={detailLoading} filters={renderStateFilters()} />}
-        {dashboardView === 'customer' && <CustomersByEmail data={pageData.customer_performance} loading={detailLoading} period={periodDisplay(time, activeYear)} orderDetails={pageData.state_order_details ?? []} channel={effectiveChannel} onChannelChange={(channel) => setPageChannel('customer', channel)} dateFilter={renderDateRangeFilter()} />}
+        {dashboardView === 'customer' && <CustomersByEmail data={pageData.customer_performance} loading={detailLoading} period={periodDisplay(time, activeYear)} orderDetails={pageData.state_order_details ?? []} channel={effectiveChannel} onChannelChange={setCustomerPageChannel} dateFilter={renderDateRangeFilter()} />}
+        {dashboardView === 'financial' && <FinancialBreakdown data={pageData.financial_breakdown} loading={detailLoading} channel={effectiveChannel} onChannelChange={(channel) => setPageChannel('financial', channel)} dateFilter={renderDateRangeFilter()} />}
       </div>
     </div>
   }
+  if (!data) return <div className="content"><div className="dashboard-loading">No dashboard data is available.</div></div>
+  const salesPlanChannels = {
+    DSG: data.monthly_plans?.DSG ?? (activeYear === 2026 ? DEFAULT_2026_SALES_PLANS.DSG : 0),
+    SFH: data.monthly_plans?.SFH ?? (activeYear === 2026 ? DEFAULT_2026_SALES_PLANS.SFH : 0),
+    Amazon: data.monthly_plans?.Amazon ?? (activeYear === 2026 ? DEFAULT_2026_SALES_PLANS.Amazon : 0),
+    'Direct Sales': data.monthly_plans?.['Direct Sales'] ?? (activeYear === 2026 ? DEFAULT_2026_SALES_PLANS['Direct Sales'] : 0),
+  }
+  const performanceCoreMonthlyPlan = ['Digital Online', 'In Office', 'Stall', 'Bulk', 'Call', 'Retail']
+    .reduce((sum, channel) => sum + (data.monthly_plans?.[channel] ?? 0), 0)
+  const selectedPlanChannel = globalChannel === 'dsg' ? 'DSG' : globalChannel === 'sfh' ? 'SFH' : globalChannel === 'amazon' ? 'Amazon' : globalChannel === 'direct' ? 'Direct Sales' : null
+  const selectedMonthlyPlan = selectedPlanChannel
+    ? salesPlanChannels[selectedPlanChannel]
+    : performanceCoreMonthlyPlan || Object.values(salesPlanChannels).reduce((sum, value) => sum + value, 0)
+
   return (
     <div className="content dashboard-page">
       <section className="intro"><div><span className="section-kicker">Reviewed sales data</span><h2>Sales KPI Dashboard</h2><p>Consolidated performance with channel filtering, category breakdowns, and monthly trends.</p></div></section>
@@ -1631,6 +1801,7 @@ function DashboardPage() {
             <button className="product-performance-button" type="button" onClick={() => openDashboardView('product')}>Product performance <span aria-hidden="true">→</span></button>
             <button type="button" onClick={() => openDashboardView('state')}>State performance</button>
             <button type="button" onClick={() => openDashboardView('customer')}>Customer performance</button>
+            <button type="button" onClick={() => openDashboardView('financial')}>Financial breakdown</button>
           </div></div>
         </div>
         <div className="dashboard-filter-groups">
@@ -1668,8 +1839,8 @@ function DashboardPage() {
             const isAllChannelsTaxCard = globalChannel === 'all' && ['zero_rated', 'exempted', 'taxable'].includes(card.id)
             const isOrderCountCard = card.id === 'orders'
             const comparison = periodComparison(card)
-            const plan = getPlanForGrain(TOTAL_SALES_MONTHLY_PLAN, time.grain, time.period)
-            const achievement = Math.round((card.total / plan) * 100)
+            const plan = getPlanForGrain(selectedMonthlyPlan, time.grain, time.period)
+            const achievement = plan > 0 ? Math.round((card.total / plan) * 100) : 0
             const achievementTone = achievement >= 100 ? 'green' : achievement >= 80 ? 'amber' : 'red'
             const roundedTotal = Math.round(card.total)
             const displayBreakdown = card.breakdown.map((item) => ({
@@ -1718,8 +1889,12 @@ function DashboardPage() {
                     <span className={`kpi-chevron ${isExpanded ? 'open' : ''}`}>⌃</span>
                   </span>
                 </button>
-                <div className="kpi-value-row">
+                <div className="kpi-value-row comparison-value-row">
                   <strong className="kpi-value">{number(card.total)} <span className="plan-value">/ {number(plan)}</span></strong>
+                  <span className={`delta-badge comparison-badge ${comparison.direction}`}>
+                    <span className="delta-arrow">{comparison.direction === 'up' ? '↑' : comparison.direction === 'down' ? '↓' : '—'}</span>
+                    {comparison.label}
+                  </span>
                 </div>
                 <p>{card.subtitle}</p>
                 <div className="plan-progress" role="progressbar" aria-label="Sales plan achievement" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(Math.max(achievement, 0), 100)}>
@@ -1736,7 +1911,7 @@ function DashboardPage() {
                 <button className="kpi-card-head" onClick={() => toggle(card.id)} aria-expanded={isExpanded}>
                   <span>{card.title}</span><span className={`kpi-chevron ${isExpanded ? 'open' : ''}`}>⌃</span>
                 </button>
-                <div className="kpi-value-row">
+                <div className="kpi-value-row comparison-value-row">
                   <strong className="kpi-value">{number(card.total)}</strong>
                   <span className={`delta-badge comparison-badge ${comparison.direction}`}>
                     <span className="delta-arrow">{comparison.direction === 'up' ? '↑' : comparison.direction === 'down' ? '↓' : '—'}</span>
@@ -1755,7 +1930,7 @@ function DashboardPage() {
                 <button className="kpi-card-head" onClick={() => toggle(card.id)} aria-expanded={isExpanded}>
                   <span>{card.title}</span><span className={`kpi-chevron ${isExpanded ? 'open' : ''}`}>⌃</span>
                 </button>
-                <div className="kpi-value-row">
+                <div className="kpi-value-row comparison-value-row">
                   <strong className="kpi-value">{number(card.total)}</strong>
                   <span className={`delta-badge comparison-badge ${comparison.direction}`}>
                     <span className="delta-arrow">{comparison.direction === 'up' ? '↑' : comparison.direction === 'down' ? '↓' : '—'}</span>
@@ -1783,7 +1958,7 @@ function DashboardPage() {
             </article>
           })}
         </section>
-        <SalesTrendChart trend={data.sales_trend} loading={loading} monthlyPlans={SALES_TREND_MONTHLY_PLANS} />
+        <SalesTrendChart key={`sales-trend-${globalChannel}`} trend={data.sales_trend} loading={loading} monthlyPlans={salesPlanChannels} allMonthlyPlan={performanceCoreMonthlyPlan || undefined} initialChannel={globalChannel === 'dsg' ? 'DSG' : globalChannel === 'sfh' ? 'SFH' : globalChannel === 'amazon' ? 'Amazon' : globalChannel === 'direct' ? 'Direct Sales' : 'all'} />
         <div className="dashboard-visual-grid">
         <section className={`category-performance category-only-performance ${loading || categoryTableLoading ? 'is-loading' : ''}`}>
           <div className="category-performance-head">
@@ -1846,8 +2021,8 @@ function DashboardPage() {
               </thead>
               <tbody>
                 {channelPerformance.map((row, index) => {
-                  const currentPlan = row.monthlyPlan * currentPlanMonths
-                  const comparisonPlan = row.monthlyPlan * comparisonPlanMonths
+                  const currentPlan = row.currentMonthlyPlan * currentPlanMonths
+                  const comparisonPlan = row.comparisonMonthlyPlan * comparisonPlanMonths
                   const currentVariance = variance(row.currentActual, currentPlan)
                   const comparisonVariance = variance(row.comparisonActual, comparisonPlan)
                   const currentPercent = variancePercent(row.currentActual, currentPlan)
@@ -1869,7 +2044,7 @@ function DashboardPage() {
           </div>
           <div className="channel-variance-legend" aria-label="Variance percentage against plan legend"><span>Variance % against plan</span><div className="legend-cluster"><b>Positive</b><div><i className="over-100" /><small>Over +100%</small></div><div><i className="above" /><small>Above plan</small></div></div><div className="legend-cluster negative-scale"><b>Negative</b>{[['miss-25','0 to -25%'],['miss-50','-50%'],['miss-75','-75%'],['miss-100','-100%']].map(([tone,label]) => <div key={tone}><i className={tone} /><small>{label}</small></div>)}</div></div>
         </section>
-        <CategoryWiseSales rows={categoryPerformance} loading={loading} channel={categoryChannel} onChannelChange={setCategoryChannel} dateFilter={renderDateRangeFilter()} />
+        <CategoryWiseSales rows={categorySalesPerformance} loading={loading} channel={categorySalesChannel} onChannelChange={setCategorySalesChannel} dateFilter={renderDateRangeFilter()} />
         </div>
       </>}
     </div>
@@ -2270,6 +2445,225 @@ function UploadHistoryPage() {
   )
 }
 
+type ManagedPlan = {
+  year: number
+  channel: string
+  monthly_plan: number
+  quarterly_plan: number
+  yearly_plan: number
+  saved: boolean
+  protected_default?: boolean
+  derived_from_legacy?: boolean
+}
+
+type ManagedCategoryPlan = Omit<ManagedPlan, 'channel'> & { category: string }
+
+const PLAN_CHANNELS = ['Digital Online', 'In Office', 'Stall', 'Bulk', 'Call', 'Retail', 'Language Lab', 'OTT']
+const PLAN_CATEGORIES = ['Books', 'Web Version', 'Audio Device', 'Pen Drive']
+
+function PlanUpdationPage() {
+  const currentYear = new Date().getFullYear()
+  const selectableYears = Array.from({ length: 12 }, (_, index) => 2026 + index)
+  const [year, setYear] = useState(Math.max(currentYear, 2026))
+  const [plans, setPlans] = useState<ManagedPlan[]>([])
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [categoryPlans, setCategoryPlans] = useState<ManagedCategoryPlan[]>([])
+  const [categoryDrafts, setCategoryDrafts] = useState<Record<string, string>>({})
+  const [planView, setPlanView] = useState<'channel' | 'category'>('channel')
+  const [loading, setLoading] = useState(true)
+  const [busyChannel, setBusyChannel] = useState('')
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let active = true
+    fetch(`/api/plans?year=${year}`)
+      .then(async (response) => {
+        const result = await response.json()
+        if (!response.ok) throw new Error(result.detail ?? 'Unable to load plans.')
+        return result
+      })
+      .then((result) => {
+        if (!active) return
+        setPlans(result.plans)
+        setDrafts(Object.fromEntries(result.plans.map((plan: ManagedPlan) => [plan.channel, String(plan.monthly_plan)])))
+        setLoading(false)
+      })
+      .catch((reason: unknown) => {
+        if (!active) return
+        setError(reason instanceof Error ? reason.message : 'Unable to load plans.')
+        setLoading(false)
+      })
+    return () => { active = false }
+  }, [year])
+
+  useEffect(() => {
+    let active = true
+    fetch(`/api/plans/categories?year=${year}`)
+      .then(async (response) => {
+        const result = await response.json()
+        if (!response.ok) throw new Error(result.detail ?? 'Unable to load category plans.')
+        return result
+      })
+      .then((result) => {
+        if (!active) return
+        setCategoryPlans(result.plans)
+        setCategoryDrafts(Object.fromEntries(result.plans.map((plan: ManagedCategoryPlan) => [plan.category, String(plan.monthly_plan)])))
+        setLoading(false)
+      })
+      .catch((reason: unknown) => {
+        if (!active) return
+        setError(reason instanceof Error ? reason.message : 'Unable to load category plans.')
+        setLoading(false)
+      })
+    return () => { active = false }
+  }, [year])
+
+  const save = async (channel: string) => {
+    const monthlyPlan = Number(drafts[channel])
+    if (!Number.isSafeInteger(monthlyPlan) || monthlyPlan < 0) {
+      setError('Enter a valid whole-number monthly plan.')
+      return
+    }
+    setBusyChannel(channel)
+    setMessage('')
+    setError('')
+    try {
+      const response = await fetch('/api/plans', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ year, channel, monthly_plan: monthlyPlan }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail ?? 'Unable to save the plan.')
+      clearDashboardCache()
+      setPlans((current) => current.map((plan) => plan.channel === channel
+        ? { ...plan, ...result, saved: true, derived_from_legacy: false }
+        : plan))
+      setMessage(`${channel} plan for ${year} saved successfully.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to save the plan.')
+    } finally {
+      setBusyChannel('')
+    }
+  }
+
+  const remove = async (plan: ManagedPlan) => {
+    if (!window.confirm(`Delete the ${plan.channel} plan for ${plan.year}? This will not affect any other year or channel.`)) return
+    setBusyChannel(plan.channel)
+    setMessage('')
+    setError('')
+    try {
+      const response = await fetch(`/api/plans/${plan.year}/${encodeURIComponent(plan.channel)}`, { method: 'DELETE' })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail ?? 'Unable to delete the plan.')
+      clearDashboardCache()
+      setPlans((current) => current.map((item) => item.channel === plan.channel
+        ? { ...item, monthly_plan: 0, quarterly_plan: 0, yearly_plan: 0, saved: false, derived_from_legacy: false }
+        : item))
+      setDrafts((current) => ({ ...current, [plan.channel]: '0' }))
+      setMessage(`${plan.channel} plan for ${plan.year} deleted successfully.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to delete the plan.')
+    } finally {
+      setBusyChannel('')
+    }
+  }
+
+  const saveCategory = async (category: string) => {
+    const monthlyPlan = Number(categoryDrafts[category])
+    if (!Number.isSafeInteger(monthlyPlan) || monthlyPlan < 0) {
+      setError('Enter a valid whole-number monthly plan.')
+      return
+    }
+    setBusyChannel(category)
+    setMessage('')
+    setError('')
+    try {
+      const response = await fetch('/api/plans/categories', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ year, category, monthly_plan: monthlyPlan }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail ?? 'Unable to save the category plan.')
+      clearDashboardCache()
+      setCategoryPlans((current) => current.map((plan) => plan.category === category
+        ? { ...plan, ...result, saved: true }
+        : plan))
+      setMessage(`${category} category plan for ${year} saved successfully.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to save the category plan.')
+    } finally {
+      setBusyChannel('')
+    }
+  }
+
+  const removeCategory = async (plan: ManagedCategoryPlan) => {
+    if (!window.confirm(`Delete the ${plan.category} category plan for ${plan.year}? Other plans will not be affected.`)) return
+    setBusyChannel(plan.category)
+    setMessage('')
+    setError('')
+    try {
+      const response = await fetch(`/api/plans/categories/${plan.year}/${encodeURIComponent(plan.category)}`, { method: 'DELETE' })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail ?? 'Unable to delete the category plan.')
+      clearDashboardCache()
+      setCategoryPlans((current) => current.map((item) => item.category === plan.category
+        ? { ...item, monthly_plan: 0, quarterly_plan: 0, yearly_plan: 0, saved: false }
+        : item))
+      setCategoryDrafts((current) => ({ ...current, [plan.category]: '0' }))
+      setMessage(`${plan.category} category plan for ${plan.year} deleted successfully.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to delete the category plan.')
+    } finally {
+      setBusyChannel('')
+    }
+  }
+
+  const amount = (value: number) => `₹${Math.round(value).toLocaleString('en-IN')}`
+
+  return <div className="content plan-page">
+    <section className="intro">
+      <div><span className="section-kicker">Yearly plan management</span><h2>Plan Updation</h2><p>Maintain one monthly plan per year and channel. Quarterly and yearly values are calculated automatically.</p></div>
+    </section>
+    <section className="plan-year-panel">
+      <label><span>Select year</span><select value={year} onChange={(event) => { setLoading(true); setError(''); setYear(Number(event.target.value)); setMessage('') }}>{selectableYears.map((value) => <option value={value} key={value}>{value}</option>)}</select></label>
+      {year === 2026 && <div className="plan-protected-note"><Icon name="info" size={17} /><span>The existing 2026 plan is protected and remains unchanged.</span></div>}
+    </section>
+    <div className="plan-view-tabs" role="tablist" aria-label="Plan type"><button type="button" role="tab" aria-selected={planView === 'channel'} className={planView === 'channel' ? 'active' : ''} onClick={() => setPlanView('channel')}>Channel Plans</button><button type="button" role="tab" aria-selected={planView === 'category'} className={planView === 'category' ? 'active' : ''} onClick={() => setPlanView('category')}>Category Plans</button></div>
+    {message && <div className="success-message plan-message"><span className="success-icon">✓</span><span>{message}</span></div>}
+    {error && <div className="error-message plan-message"><Icon name="info" size={18} /><span>{error}</span></div>}
+    {loading ? <div className="dashboard-loading">Loading plans…</div> : planView === 'channel' ? <section className="plan-grid" aria-label={`${year} channel plans`}>
+      {PLAN_CHANNELS.map((channel) => {
+        const plan = plans.find((item) => item.channel === channel)
+        const monthly = Number(drafts[channel] ?? 0) || 0
+        const isProtected = year === 2026
+        const busy = busyChannel === channel
+        return <article className="plan-card" key={channel}>
+          <div className="plan-card-head"><div><span>Channel</span><h3>{channel}</h3></div><span className={plan?.saved ? 'plan-status saved' : isProtected ? 'plan-status protected' : 'plan-status'}>{plan?.saved ? 'Saved' : isProtected ? '2026 default' : plan?.derived_from_legacy ? 'Legacy total' : 'Not saved'}</span></div>
+          <label className="plan-input"><span>Monthly plan</span><div><span>₹</span><input type="number" min="0" step="1" value={drafts[channel] ?? ''} disabled={isProtected || busy} onChange={(event) => setDrafts((current) => ({ ...current, [channel]: event.target.value }))} /></div></label>
+          <div className="plan-calculations"><div><span>Quarterly (×3)</span><strong>{amount(monthly * 3)}</strong></div><div><span>Yearly (×12)</span><strong>{amount(monthly * 12)}</strong></div></div>
+          <div className="plan-actions"><button className="primary-button" type="button" disabled={isProtected || busy} onClick={() => { void save(channel) }}>{busy ? 'Saving…' : plan?.saved ? 'Updated' : 'Save'}</button><button className="plan-delete-button" type="button" disabled={isProtected || !plan?.saved || busy} onClick={() => { if (plan) void remove(plan) }}>Delete</button></div>
+        </article>
+      })}
+    </section> : <section className="plan-grid plan-category-grid" aria-label={`${year} category plans`}>
+      {PLAN_CATEGORIES.map((category) => {
+        const plan = categoryPlans.find((item) => item.category === category)
+        const monthly = Number(categoryDrafts[category] ?? 0) || 0
+        const isProtected = year === 2026
+        const busy = busyChannel === category
+        return <article className="plan-card" key={category}>
+          <div className="plan-card-head"><div><span>Category</span><h3>{category}</h3></div><span className={plan?.saved ? 'plan-status saved' : isProtected ? 'plan-status protected' : 'plan-status'}>{plan?.saved ? 'Saved' : isProtected ? '2026 default' : 'Not saved'}</span></div>
+          <label className="plan-input"><span>Monthly plan</span><div><span>₹</span><input type="number" min="0" step="1" value={categoryDrafts[category] ?? ''} disabled={isProtected || busy} onChange={(event) => setCategoryDrafts((current) => ({ ...current, [category]: event.target.value }))} /></div></label>
+          <div className="plan-calculations"><div><span>Quarterly (×3)</span><strong>{amount(monthly * 3)}</strong></div><div><span>Yearly (×12)</span><strong>{amount(monthly * 12)}</strong></div></div>
+          <div className="plan-actions"><button className="primary-button" type="button" disabled={isProtected || busy} onClick={() => { void saveCategory(category) }}>{busy ? 'Saving…' : plan?.saved ? 'Updated' : 'Save'}</button><button className="plan-delete-button" type="button" disabled={isProtected || !plan?.saved || busy} onClick={() => { if (plan) void removeCategory(plan) }}>Delete</button></div>
+        </article>
+      })}
+    </section>}
+  </div>
+}
+
 function App() {
   const [activeModule, setActiveModule] = useState<ModuleId>('upload')
   const [file, setFile] = useState<File | null>(null)
@@ -2476,7 +2870,7 @@ function App() {
           <div className="environment"><span /> Production</div>
         </header>
 
-        {activeModule === 'dashboard' ? <DashboardPage /> : activeModule === 'reports' ? <ReportCenter /> : activeModule === 'history' ? <UploadHistoryPage /> : activeModule !== 'upload' ? <Placeholder title={activeLabel} /> : workflowPage === 'category' ? (
+        {activeModule === 'dashboard' ? <DashboardPage /> : activeModule === 'reports' ? <ReportCenter /> : activeModule === 'plans' ? <PlanUpdationPage /> : activeModule === 'history' ? <UploadHistoryPage /> : activeModule !== 'upload' ? <Placeholder title={activeLabel} /> : workflowPage === 'category' ? (
           <CategoryReview uploadId={uploadId} initialRows={reviewRows} channel={selectedChannel} onBack={() => setWorkflowPage('upload')} onContinue={continueAfterCategory} />
         ) : workflowPage === 'product' ? (
           <ProductReview uploadId={uploadId} initialGroups={productGroups} channel={selectedChannel} onPendingGroupsChange={setProductGroups} onComplete={() => { void completeAndShowHistory(uploadId, null, true) }} />

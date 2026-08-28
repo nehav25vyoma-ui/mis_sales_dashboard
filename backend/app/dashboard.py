@@ -2,6 +2,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from functools import lru_cache
+import re
 from threading import Lock
 from time import monotonic
 from typing import Any
@@ -13,6 +14,7 @@ from sqlalchemy import func
 from app.database.database import SessionLocal
 from app.database.models import AmazonDatasetRow, DirectSalesDatasetRow, DSGDatasetRow, SFHDatasetRow, UploadHistory
 from app.calculations.amounts import sfh_amount_from_record, sfh_is_inr_currency
+from app.plans import category_plans_for_year, plan_data_version, plans_for_year, saved_plan_years
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
@@ -191,24 +193,46 @@ def _direct_amount(row: DirectSalesDatasetRow) -> float:
     return _number(value if value is not None else row.amount)
 
 
-def _direct_sales_channel(row: DirectSalesDatasetRow) -> str:
-    """Return the shared dashboard channel mapping for a Direct Sales row."""
+def _direct_bulk_invoice_ids(rows) -> set[str]:
+    """Return invoices having at least one individual inventory Qty over 10."""
+    bulk_invoices: set[str] = set()
+    for row in rows:
+        quantity = _row_value(
+            row.row_data,
+            ("bulk classification quantity", "category quantity"),
+        )
+        if _number(quantity) > 10:
+            invoice = _order_identifier("Direct Sales", row)
+            if invoice:
+                bulk_invoices.add(invoice)
+    return bulk_invoices
+
+
+def _direct_sales_channel(
+    row: DirectSalesDatasetRow,
+    invoice_is_bulk: bool | None = None,
+) -> str:
+    """Return the detailed Direct Sales mapping used by Channel Performance."""
     private_notes = str(_row_value(row.row_data, ("private notes",)) or "").casefold()
-    # Private Notes is authoritative for the two named channels. Checking it
-    # first also classifies datasets saved before Language Lab was introduced.
     if "language lab" in private_notes:
         return "Language Lab"
-    classification = str(
-        _row_value(row.row_data, ("sales classification",))
-        or (
-            "Stall Sales"
-            if "stall" in private_notes
-            else "Bulk Sales"
-            if _number(_row_value(row.row_data, ("mapped quantity",))) > 10
-            else "Direct Sales"
-        )
-    )
-    return classification if classification in {"Direct Sales", "Stall Sales", "Bulk Sales", "Language Lab"} else "Direct Sales"
+    # Re-evaluate from the persisted invoice notes and invoice-level mapped
+    # quantity so older uploads receive the current mutually exclusive mapping.
+    if "stall" in private_notes:
+        return "Stall"
+    if "vedanta" in private_notes:
+        return "Retail"
+    if invoice_is_bulk is True or (
+        invoice_is_bulk is None
+        and _number(_row_value(
+            row.row_data,
+            ("bulk classification quantity", "category quantity", "mapped quantity"),
+        )) > 10
+    ):
+        return "Bulk"
+    if any(term in private_notes for term in ("phone", "ph no", "call")):
+        return "Call"
+    return "In Office"
     try:
         return float(str(value).replace(",", "").replace("₹", "").strip())
     except (TypeError, ValueError):
@@ -221,6 +245,15 @@ def _amazon_is_cancelled(row: AmazonDatasetRow) -> bool:
     return str(status or "").strip().casefold() in {
         "cancelled", "shipped - returning to seller",
     }
+
+
+def _amazon_is_excluded(row: AmazonDatasetRow) -> bool:
+    """Exclude invalid Amazon sales rows from every MIS calculation."""
+    status = _row_value(row.row_data, ("order-status", "order status"))
+    item_price = _row_value(row.row_data, ("item-price", "item price"))
+    return str(status or "").strip().casefold() != "shipped - delivered to buyer" or _number(
+        item_price if item_price is not None else row.amount
+    ) == 0
 
 
 def _dsg_is_completed(row: DSGDatasetRow) -> bool:
@@ -248,7 +281,7 @@ def _unique_order_count(rows) -> int:
     for channel, row, _ in rows:
         if channel == "DSG" and not _dsg_is_completed(row):
             continue
-        if channel == "Amazon" and _amazon_is_cancelled(row):
+        if channel == "Amazon" and _amazon_is_excluded(row):
             continue
         identifier = _order_identifier(channel, row)
         if identifier:
@@ -291,6 +324,108 @@ def _period_order_counts(grain: str, period: str, year: int) -> dict[str, int]:
     }
 
 
+def _financial_breakdown(grain: str, period: str, year: int) -> dict[str, dict[str, float]]:
+    """Return Summary-report financial columns for the selected period."""
+    selected_months = {int(value) for value in period.split(",")} if grain == "monthly" else set()
+
+    def included(month_key: str) -> bool:
+        row_year, row_month = (int(value) for value in month_key.split("-"))
+        if grain == "monthly":
+            return row_year == year and row_month in selected_months
+        if grain == "quarterly":
+            return row_year == year and ((row_month - 1) // 3) + 1 == int(period)
+        return row_year == year
+
+    keys = ("basic_value", "shipping", "discount", "taxable_value", "total_tax", "total_sale")
+    result = {name: {key: 0.0 for key in keys} for name in ("DSG", "SFH", "Amazon", "Direct Sales")}
+    upload_dates = _cached_upload_dates()
+    fallback = datetime.now()
+
+    def financial_number(value: object) -> float:
+        """Parse report currency cells without changing shared numeric rules."""
+        if value is None:
+            return 0.0
+        text = str(value).strip().replace(",", "")
+        negative = text.startswith("(") and text.endswith(")")
+        cleaned = re.sub(r"[^0-9.\-]", "", text)
+        try:
+            parsed = float(cleaned)
+            return -abs(parsed) if negative else parsed
+        except (TypeError, ValueError):
+            return 0.0
+
+    shipped_dsg_orders: set[str] = set()
+    taxed_dsg_orders: set[str] = set()
+    for row in _cached_rows(DSGDatasetRow):
+        if not _dsg_is_completed(row) or not included(_month(row.row_data, upload_dates.get(row.upload_id, fallback))):
+            continue
+        data = row.row_data
+        financial_basic = _row_value(data, ("iteamcostxquantity",))
+        basic = financial_number(financial_basic) if financial_basic is not None else _dsg_basic_amount(row)
+        order = _order_identifier("DSG", row)
+        shipping = financial_number(_row_value(data, ("order shipping amount",))) if order not in shipped_dsg_orders else 0.0
+        shipped_dsg_orders.add(order)
+        discount = _number(_row_value(data, ("cart discount amount",)))
+        taxable = basic + shipping - discount
+        tax = financial_number(_row_value(data, ("order total tax amount",))) if order not in taxed_dsg_orders else 0.0
+        taxed_dsg_orders.add(order)
+        total_sale = taxable + tax
+        for key, value in (("basic_value", basic), ("shipping", shipping), ("discount", discount), ("taxable_value", taxable), ("total_tax", tax), ("total_sale", total_sale)):
+            result["DSG"][key] += value
+
+    for row in _cached_rows(SFHDatasetRow):
+        if not included(_month(row.row_data, upload_dates.get(row.upload_id, fallback))):
+            continue
+        data = row.row_data
+        earnings_currency = _row_value(data, ("earnings currency",))
+        is_inr = sfh_is_inr_currency(earnings_currency)
+        basic = financial_number(_row_value(data, ("without tax total",) if is_inr else ("earnings",)))
+        tax = financial_number(_row_value(data, ("tax",))) if is_inr else 0.0
+        result["SFH"]["basic_value"] += basic
+        result["SFH"]["taxable_value"] += basic
+        result["SFH"]["total_tax"] += tax
+        result["SFH"]["total_sale"] += basic + tax
+
+    for row in _cached_rows(AmazonDatasetRow):
+        status = str(_row_value(row.row_data, ("order-status", "order status")) or "").strip().casefold()
+        if status != "shipped - delivered to buyer" or not included(_month(row.row_data, upload_dates.get(row.upload_id, fallback))):
+            continue
+        data = row.row_data
+        basic = financial_number(_row_value(data, ("item-price", "item price")))
+        shipping = financial_number(_row_value(data, ("shipping-price", "shipping price")))
+        taxable = basic + shipping
+        result["Amazon"]["basic_value"] += basic
+        result["Amazon"]["shipping"] += shipping
+        result["Amazon"]["taxable_value"] += taxable
+        result["Amazon"]["total_sale"] += taxable
+
+    direct_rows = [
+        row for row in _cached_rows(DirectSalesDatasetRow)
+        if str(_row_value(row.row_data, ("status",)) or "").strip().casefold() != "cancelled"
+        and included(_month(row.row_data, upload_dates.get(row.upload_id, fallback)))
+    ]
+    invoice_totals: defaultdict[str, float] = defaultdict(float)
+    for row in direct_rows:
+        invoice_totals[_order_identifier("Direct Sales", row)] += _direct_amount(row)
+    for row in direct_rows:
+        invoice = _order_identifier("Direct Sales", row)
+        invoice_total = invoice_totals[invoice]
+        data = row.row_data
+        basic = financial_number(_row_value(data, ("without tax total",)))
+        allocation = basic / invoice_total if invoice_total else 0.0
+        discount = 0.0
+        taxable = basic - discount
+        tax = financial_number(_row_value(data, ("tax",))) * allocation
+        total_sale = financial_number(_row_value(data, ("total",))) * allocation
+        result["Direct Sales"]["basic_value"] += basic
+        result["Direct Sales"]["discount"] += discount
+        result["Direct Sales"]["taxable_value"] += taxable
+        result["Direct Sales"]["total_tax"] += tax
+        result["Direct Sales"]["total_sale"] += total_sale
+
+    return {channel: {key: _rounded(value) for key, value in values.items()} for channel, values in result.items()}
+
+
 def _dsg_pnl_amount(row: DSGDatasetRow, charged_orders: set[str]) -> float:
     """Return DSG P&L value, allocating filled-down shipping once per order."""
     data = row.row_data
@@ -308,6 +443,21 @@ def _dsg_pnl_amount(row: DSGDatasetRow, charged_orders: set[str]) -> float:
         if include_shipping else 0.0
     )
     return basic_value + shipping + discount
+
+
+def _dsg_basic_amount(row: DSGDatasetRow) -> float:
+    """Return DSG Basic Value exclusively from Item Cost x Quantity."""
+    value = _row_value(
+        row.row_data,
+        (
+            "item cost × quantity",
+            "item cost x quantity",
+            "item cost*quantity",
+            "item cost * quantity",
+            "itemcostxquantity",
+        ),
+    )
+    return _number(value if value is not None else row.amount)
 
 
 @lru_cache(maxsize=8192)
@@ -486,7 +636,6 @@ def _load_channel_metrics() -> dict[str, dict[str, Any]]:
     }
     with nullcontext():
         upload_dates = _cached_upload_dates()
-        dsg_charged_orders: set[str] = set()
         for row in _cached_rows(DSGDatasetRow):
             if not _dsg_is_completed(row):
                 continue
@@ -495,7 +644,7 @@ def _load_channel_metrics() -> dict[str, dict[str, Any]]:
             _add_row(
                 channels["dsg"],
                 category=row.category or "",
-                amount=_dsg_pnl_amount(row, dsg_charged_orders),
+                amount=_dsg_basic_amount(row),
                 is_foreign=str(country_code).strip().upper() != "IN",
                 month=_month(row.row_data, uploaded_at),
             )
@@ -510,7 +659,7 @@ def _load_channel_metrics() -> dict[str, dict[str, Any]]:
                 month=_month(row.row_data, uploaded_at),
             )
         for row in _cached_rows(AmazonDatasetRow):
-            if _amazon_is_cancelled(row):
+            if _amazon_is_excluded(row):
                 continue
             uploaded_at = upload_dates.get(row.upload_id, datetime.now())
             _add_row(
@@ -564,17 +713,25 @@ def _direct_sales_classification(
             row_year == selected_year and row_month <= cutoff
         )
 
-    totals = {"Direct Sales": 0.0, "Stall Sales": 0.0, "Bulk Sales": 0.0, "Language Lab": 0.0}
+    totals = {
+        "In Office": 0.0, "Stall": 0.0, "Bulk": 0.0,
+        "Call": 0.0, "Retail": 0.0, "Language Lab": 0.0,
+    }
     with nullcontext():
         upload_dates = _cached_upload_dates()
-        for row in _cached_rows(DirectSalesDatasetRow):
+        direct_rows = list(_cached_rows(DirectSalesDatasetRow))
+        bulk_invoices = _direct_bulk_invoice_ids(direct_rows)
+        for row in direct_rows:
             month = _month(row.row_data, upload_dates.get(row.upload_id, current))
             if not included(month):
                 continue
-            classification = _direct_sales_channel(row)
+            classification = _direct_sales_channel(
+                row,
+                _order_identifier("Direct Sales", row) in bulk_invoices,
+            )
             totals[classification] += _direct_amount(row)
     totals["Total Direct Sales"] = sum(
-        totals[channel] for channel in ("Direct Sales", "Stall Sales", "Bulk Sales")
+        totals[channel] for channel in ("In Office", "Stall", "Bulk", "Call", "Retail")
     )
     return {key: _rounded(value) for key, value in totals.items()}
 
@@ -681,7 +838,11 @@ def _product_rankings(
         discount = _number(_row_value(data, ("discount", "discount amount")))
         taxable = _number(_row_value(data, ("taxable value", "without tax total", "basic value")))
         tax = _number(_row_value(data, ("tax", "tax amount", "gst", "total tax")))
-        basic = _number(_row_value(data, ("basic value", "item cost", "without tax total")))
+        basic = (
+            _dsg_basic_amount(row)  # type: ignore[arg-type]
+            if channel_label == "DSG"
+            else _number(_row_value(data, ("basic value", "item cost", "without tax total")))
+        )
         details.append({
             "year": int(year_value), "month": int(month_value), "channel": channel_label,
             "category": str(getattr(row, "category", "") or ""), "orders": 1,
@@ -693,7 +854,6 @@ def _product_rankings(
     with nullcontext():
         upload_dates = _cached_upload_dates()
         if channel in {"all", "dsg"}:
-            dsg_charged_orders: set[str] = set()
             for row in _cached_rows(DSGDatasetRow):
                 if not _dsg_is_completed(row):
                     continue
@@ -705,7 +865,7 @@ def _product_rankings(
                 if product and included(month):
                     key = product.casefold()
                     labels["dsg"].setdefault(key, product)
-                    amount = _dsg_pnl_amount(row, dsg_charged_orders)
+                    amount = _dsg_basic_amount(row)
                     totals["dsg"][key] += amount
                     add_detail("DSG", row, month, product, amount)
         if channel in {"all", "sfh"}:
@@ -723,7 +883,7 @@ def _product_rankings(
                     add_detail("SFH", row, month, course, amount)
         if channel in {"all", "amazon"}:
             for row in _cached_rows(AmazonDatasetRow):
-                if _amazon_is_cancelled(row):
+                if _amazon_is_excluded(row):
                     continue
                 month = _month(row.row_data, upload_dates.get(row.upload_id, current))
                 product = str(row.product_name or "").strip()
@@ -836,7 +996,7 @@ def _customer_performance(
                     email_counts[email] += 1
         if channel in {"all", "amazon"}:
             for row in _cached_rows(AmazonDatasetRow):
-                if _amazon_is_cancelled(row):
+                if _amazon_is_excluded(row):
                     continue
                 month = _month(row.row_data, upload_dates.get(row.upload_id, current))
                 email = str(_row_value(row.row_data, ("buyer email", "email")) or "").strip().casefold()
@@ -878,17 +1038,16 @@ def _customer_mix_context(channel: str, grain: str, period: str, selected_year: 
     for source, model in sources:
         if channel not in {"all", source}:
             continue
-        charged_orders: set[str] = set()
         for row in _cached_rows(model):
             if source == "dsg" and not _dsg_is_completed(row):
                 continue
-            if source == "amazon" and _amazon_is_cancelled(row):
+            if source == "amazon" and _amazon_is_excluded(row):
                 continue
             email = str(_first_nonempty_row_value(row.row_data, email_aliases[source]) or "").strip().casefold()
             if not email:
                 continue
             if source == "dsg":
-                amount, label = _dsg_pnl_amount(row, charged_orders), "DSG"
+                amount, label = _dsg_basic_amount(row), "DSG"
             elif source == "sfh":
                 amount, label = _number(sfh_amount_from_record(row.row_data)), "SFH"
             elif source == "amazon":
@@ -968,12 +1127,11 @@ def _state_performance(
             sources.append(("amazon", _cached_rows(AmazonDatasetRow)))
         if channel in {"all", "direct"}:
             sources.append(("direct", _cached_rows(DirectSalesDatasetRow)))
-        dsg_charged_orders: set[str] = set()
         for source, source_rows in sources:
             for row in source_rows:
                 if source == "dsg" and not _dsg_is_completed(row):
                     continue
-                if source == "amazon" and _amazon_is_cancelled(row):
+                if source == "amazon" and _amazon_is_excluded(row):
                     continue
                 month_key = _month(row.row_data, upload_dates.get(row.upload_id, current))
                 if not included(month_key):
@@ -983,7 +1141,7 @@ def _state_performance(
                         _row_value(row.row_data, ("state code (billing)",)),
                         _row_value(row.row_data, ("country code (billing)",)),
                     )
-                    amount = _dsg_pnl_amount(row, dsg_charged_orders)
+                    amount = _dsg_basic_amount(row)
                 elif source == "sfh":
                     state = _state_name(
                         _first_nonempty_row_value(row.row_data, ("place of supply", "state"))
@@ -1087,13 +1245,17 @@ def _build_dashboard_kpis(
     comparison_grain: str | None = None,
     comparison_period: str | None = None,
     comparison_year: int | None = None,
+    view: str = "overview",
 ) -> dict[str, object]:
     if grain not in {"monthly", "quarterly", "yearly"}:
         raise HTTPException(status_code=422, detail="Time grain must be monthly, quarterly, or yearly.")
+    if view not in {"overview", "product", "state", "customer", "financial"}:
+        raise HTTPException(status_code=422, detail="Invalid dashboard view.")
     channel_metrics = _load_channel_metrics()
     current = datetime.now()
     available_years = sorted(
-        {current.year}
+        {current.year, 2026}
+        | saved_plan_years()
         | {
             int(month.split("-")[0])
             for metrics in channel_metrics.values()
@@ -1254,6 +1416,8 @@ def _build_dashboard_kpis(
         table_comparison_year,
     )
 
+    primary_category_plans = category_plans_for_year(primary_year)
+    comparison_category_plans = category_plans_for_year(table_comparison_year)
     category_performance = []
     for category, label in (
         ("Books", "Books"),
@@ -1261,8 +1425,8 @@ def _build_dashboard_kpis(
         ("Audio Device", "Audio Device"),
         ("Pen Drive", "Pen Drives"),
     ):
-        current_plan = CATEGORY_MONTHLY_PLANS[category] * primary_plan_months
-        comparison_plan = CATEGORY_MONTHLY_PLANS[category] * comparison_plan_months
+        current_plan = primary_category_plans[category] * primary_plan_months
+        comparison_plan = comparison_category_plans[category] * comparison_plan_months
         category_performance.append(
             {
                 "category": label,
@@ -1270,30 +1434,34 @@ def _build_dashboard_kpis(
                 "comparison": {"plan": comparison_plan, "actual": _rounded(comparison_actuals[category])},
             }
         )
-    product_performance = _product_rankings(
-        channel,
-        grain,
-        period,
-        primary_year,
-    )
-    customer_performance = _customer_performance(
-        channel,
-        grain,
-        period,
-        primary_year,
-    )
-    customer_performance.update(_customer_mix_context(channel, grain, period, primary_year))
-    state_performance, state_order_details = _state_performance(
-        channel, grain, period, primary_year, include_details=True
-    )
-    direct_sales_performance = {
+    product_performance = _product_rankings(channel, grain, period, primary_year) if view == "product" else {"channels": [], "details": []}
+    customer_performance: dict[str, object] = {}
+    if view == "customer":
+        customer_performance = _customer_performance(channel, grain, period, primary_year)
+        customer_performance.update(_customer_mix_context(channel, grain, period, primary_year))
+    if view in {"state", "customer"}:
+        state_performance, state_order_details = _state_performance(
+            channel, grain, period, primary_year, include_details=True
+        )
+    else:
+        state_performance, state_order_details = [], []
+    empty_direct_performance = {
+        "In Office": 0.0,
+        "Stall": 0.0,
+        "Bulk": 0.0,
+        "Call": 0.0,
+        "Retail": 0.0,
+        "Language Lab": 0.0,
+        "Total Direct Sales": 0.0,
+    }
+    direct_sales_performance = ({
         "current": _direct_sales_classification(grain, period, primary_year),
         "comparison": _direct_sales_classification(
             table_comparison_grain,
             table_comparison_period,
             table_comparison_year,
         ),
-    }
+    } if view == "overview" else {"current": dict(empty_direct_performance), "comparison": dict(empty_direct_performance)})
     digital_channels = (
         ("dsg", "sfh", "amazon")
         if channel == "all"
@@ -1316,20 +1484,8 @@ def _build_dashboard_kpis(
     )
     if channel not in {"all", "direct"}:
         direct_sales_performance = {
-            "current": {
-                "Direct Sales": 0.0,
-                "Stall Sales": 0.0,
-                "Bulk Sales": 0.0,
-                "Language Lab": 0.0,
-                "Total Direct Sales": 0.0,
-            },
-            "comparison": {
-                "Direct Sales": 0.0,
-                "Stall Sales": 0.0,
-                "Bulk Sales": 0.0,
-                "Language Lab": 0.0,
-                "Total Direct Sales": 0.0,
-            },
+            "current": dict(empty_direct_performance),
+            "comparison": dict(empty_direct_performance),
         }
 
     def channel_wise_values(
@@ -1337,17 +1493,21 @@ def _build_dashboard_kpis(
     ) -> dict[str, float]:
         values = {
             "Digital Online": _rounded(digital),
-            "Stall Sales": direct_values["Stall Sales"],
-            "Direct Sales": direct_values["Direct Sales"],
-            "Bulk Sales": direct_values["Bulk Sales"],
+            "In Office": direct_values["In Office"],
+            "Stall": direct_values["Stall"],
+            "Bulk": direct_values["Bulk"],
+            "Call": direct_values["Call"],
+            "Retail": direct_values["Retail"],
             "Language Lab": direct_values["Language Lab"],
             "OTT": 0.0,
         }
         values["Total Sales"] = _rounded(
             values["Digital Online"]
-            + values["Stall Sales"]
-            + values["Direct Sales"]
-            + values["Bulk Sales"]
+            + values["In Office"]
+            + values["Stall"]
+            + values["Bulk"]
+            + values["Call"]
+            + values["Retail"]
         )
         values["Grand Total Sales"] = _rounded(
             values["Total Sales"] + values["Language Lab"] + values["OTT"]
@@ -1473,9 +1633,14 @@ def _build_dashboard_kpis(
         "selected_period": period,
         "selected_year": primary_year,
         "available_years": available_years,
+        "monthly_plans": plans_for_year(primary_year),
+        "comparison_monthly_plans": plans_for_year(table_comparison_year),
+        "category_monthly_plans": primary_category_plans,
+        "comparison_category_monthly_plans": comparison_category_plans,
         "category_performance": category_performance,
         "product_performance": product_performance,
         "customer_performance": customer_performance,
+        "financial_breakdown": _financial_breakdown(grain, period, primary_year) if view == "financial" else {},
         "state_performance": state_performance,
         "state_order_details": state_order_details,
         "direct_sales_performance": direct_sales_performance,
@@ -1536,11 +1701,12 @@ def dashboard_kpis(
     comparison_grain: str | None = None,
     comparison_period: str | None = None,
     comparison_year: int | None = None,
+    view: str = "overview",
 ) -> dict[str, object]:
     """Return cached visual data unless filters or uploaded datasets changed."""
     cache_key = (
-        _dashboard_data_version(), channel, grain, period, year, latest,
-        comparison_grain, comparison_period, comparison_year,
+        _dashboard_data_version(), plan_data_version(), channel, grain, period, year, latest,
+        comparison_grain, comparison_period, comparison_year, view,
     )
     now = monotonic()
     with _dashboard_cache_lock:
@@ -1560,12 +1726,13 @@ def dashboard_kpis(
         comparison_grain=comparison_grain,
         comparison_period=comparison_period,
         comparison_year=comparison_year,
+        view=view,
     )
     with _dashboard_cache_lock:
-        current_version = cache_key[0]
+        current_version = cache_key[:2]
         expired_keys = [
             key for key, (stored_at, _) in _dashboard_response_cache.items()
-            if key[0] != current_version or now - stored_at >= DASHBOARD_CACHE_TTL_SECONDS
+            if key[:2] != current_version or now - stored_at >= DASHBOARD_CACHE_TTL_SECONDS
         ]
         for key in expired_keys:
             _dashboard_response_cache.pop(key, None)

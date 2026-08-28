@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.database import Base
@@ -118,3 +118,37 @@ class AmazonDatasetRow(Base):
     row_data: Mapped[dict] = mapped_column(JSON, nullable=False)
 
     upload: Mapped[UploadHistory] = relationship(back_populates="amazon_rows")
+
+
+class ChannelPlan(Base):
+    __tablename__ = "channel_plans"
+    __table_args__ = (UniqueConstraint("year", "channel", name="uq_channel_plans_year_channel"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    year: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    channel: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    monthly_plan: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class CategoryPlan(Base):
+    __tablename__ = "category_plans"
+    __table_args__ = (UniqueConstraint("year", "category", name="uq_category_plans_year_category"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    year: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    category: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    monthly_plan: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

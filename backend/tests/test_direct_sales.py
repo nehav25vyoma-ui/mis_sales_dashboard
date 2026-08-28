@@ -57,7 +57,7 @@ class DirectSalesUploadTests(unittest.TestCase):
         self.assertEqual(list(frame["Mapped Quantity"]), [11.0, 11.0, 11.0, 11.0])
         self.assertEqual(
             list(frame["Sales Classification"]),
-            ["Bulk Sales", "Bulk Sales", "Stall Sales", "Stall Sales"],
+            ["In Office", "In Office", "Stall", "Stall"],
         )
         self.assertAlmostEqual(frame["Without Tax Total"].sum(), 300.0)
         product_totals = frame.groupby("Product Name")["Without Tax Total"].sum()
@@ -74,6 +74,32 @@ class DirectSalesUploadTests(unittest.TestCase):
             asyncio.run(direct_sales.upload_direct_sales(invoice, inventory))
         self.assertIn("Item Details", str(raised.exception.detail))
 
+    def test_bulk_uses_individual_quantity_within_each_mapped_invoice(self):
+        invoice = _upload(
+            "invoice.csv",
+            "Invoice Number,Without Tax Total,Private Notes\n1001,110,\n1002,100,\n1003,110,\n",
+        )
+        inventory = _upload(
+            "inventory.csv",
+            "Doc No.,Category,Item Details,Qty\n"
+            "1001,Books,A,3\n1001,Books,B,3\n1001,Books,C,3\n1001,Books,D,2\n"
+            "1002,Books,E,5\n1002,Books,F,5\n1003,Books,G,11\n",
+        )
+        with patch.object(direct_sales, "SessionLocal", return_value=_Database()):
+            result = asyncio.run(direct_sales.upload_direct_sales(invoice, inventory))
+
+        frame = direct_sales.DIRECT_SALES_UPLOAD_STORE[str(result["upload_id"])]["frame"]
+        invoice_column = "Invoice Number"
+        summed_rows = frame.loc[frame[invoice_column] == 1001]
+        boundary_rows = frame.loc[frame[invoice_column] == 1002]
+        bulk_rows = frame.loc[frame[invoice_column] == 1003]
+        self.assertEqual(set(summed_rows["Mapped Quantity"]), {11.0})
+        self.assertEqual(set(summed_rows["Sales Classification"]), {"In Office"})
+        self.assertEqual(set(boundary_rows["Mapped Quantity"]), {10.0})
+        self.assertEqual(set(boundary_rows["Sales Classification"]), {"In Office"})
+        self.assertEqual(set(bulk_rows["Bulk Classification Quantity"]), {11.0})
+        self.assertEqual(set(bulk_rows["Sales Classification"]), {"Bulk"})
+
     def test_rejects_a_missing_dataset(self):
         invoice = _upload(
             "invoice.csv",
@@ -85,9 +111,13 @@ class DirectSalesUploadTests(unittest.TestCase):
 
     def test_sales_classification_is_mutually_exclusive_with_stall_precedence(self):
         self.assertEqual(direct_sales._sales_classification("Language Lab order", 25), "Language Lab")
-        self.assertEqual(direct_sales._sales_classification("Annual STALL event", 25), "Stall Sales")
-        self.assertEqual(direct_sales._sales_classification("", 11), "Bulk Sales")
-        self.assertEqual(direct_sales._sales_classification("", 10), "Direct Sales")
+        self.assertEqual(direct_sales._sales_classification("Annual STALL event", 25), "Stall")
+        self.assertEqual(direct_sales._sales_classification("", 11), "Bulk")
+        self.assertEqual(direct_sales._sales_classification("please call this phone", 10), "Call")
+        self.assertEqual(direct_sales._sales_classification("Vedanta", 10), "Retail")
+        self.assertEqual(direct_sales._sales_classification("Vedanta", 25), "Retail")
+        self.assertEqual(direct_sales._sales_classification("", 10), "In Office")
+        self.assertEqual(direct_sales._sales_classification("Vedanta stall", 1), "Stall")
 
 
 if __name__ == "__main__":

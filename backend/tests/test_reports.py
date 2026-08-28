@@ -17,8 +17,8 @@ from app.reports import (
     _product_type,
     _summary_workbook,
 )
-from app.database.models import DirectSalesDatasetRow, UploadHistory
-from app.dashboard import _amazon_is_cancelled, _direct_amount, _dsg_pnl_amount, _month, _unique_order_count
+from app.database.models import AmazonDatasetRow, DirectSalesDatasetRow, DSGDatasetRow, SFHDatasetRow, UploadHistory
+from app.dashboard import _amazon_is_cancelled, _amazon_is_excluded, _direct_amount, _direct_sales_channel, _dsg_basic_amount, _dsg_pnl_amount, _financial_breakdown, _month, _unique_order_count
 from openpyxl import Workbook
 
 
@@ -84,11 +84,41 @@ def test_summary_displayed_pnl_equals_displayed_sales_buckets(monkeypatch):
         buckets = sum(sheet.cell(row_number, column).value for column in (4, 5, 6))
         assert abs(sheet.cell(row_number, 7).value - buckets) <= 1
         assert sheet.cell(row_number, 9).value == sheet.cell(row_number, 7).value + sheet.cell(row_number, 8).value
-    assert sheet.cell(5, 7).value == 112062
+    assert sheet.cell(5, 7).value == 1
     assert [sheet.cell(row, 3).value for row in range(3, 6)] == [1, 1, 1]
     assert [sheet.cell(row, 2).value for row in range(3, 6)] == [
         "DSG", "SFH", "Direct Sales",
     ]
+
+
+def test_summary_direct_sales_matches_detail_rows_and_includes_na(monkeypatch):
+    monkeypatch.setattr("app.reports._load_channel_metrics", lambda: {
+        "direct": {
+            "zero_rated": 0.0, "exempted": 9999.0,
+            "taxable": 9999.0, "pnl": 19998.0,
+        },
+    })
+    monkeypatch.setattr("app.reports._for_period", lambda values, *_: values)
+    rows = [
+        ("Direct Sales", _direct_row(1, "D-1", "Book", 100.4, 1), "2026-07"),
+        ("Direct Sales", SimpleNamespace(
+            id=2, upload_id="upload", source_row_number=2,
+            order_number="D-2", category="N/A", product_name="Other",
+            amount="50.4", row_data={
+                "Invoice Number": "D-2", "Without Tax Total": 50.4,
+                "Category": "N/A", "Item Details": "Other", "Quantity": 1,
+            },
+        ), "2026-07"),
+    ]
+
+    workbook = _summary_workbook(rows, "monthly", "7", 2026)
+    summary = workbook["Summary"]
+    detail = workbook["Direct Sales"]
+
+    assert summary.cell(3, 5).value == 100
+    assert summary.cell(3, 6).value == 50
+    assert summary.cell(3, 7).value == 151
+    assert sum(detail.cell(row, 8).value for row in (3, 4)) == pytest.approx(150.8)
 
 
 def test_clean_report_total_matches_rounded_raw_aggregate():
@@ -183,6 +213,49 @@ def test_dsg_pnl_amount_adds_shipping_once_and_discount_per_product_row():
     ) == 315
 
 
+def test_dsg_basic_amount_uses_item_cost_x_quantity_only():
+    row = _dsg_summary_row("ORD-1", "Completed", "Book A", 100, 1, 25, -10, 18)
+    row.amount = "999"
+
+    assert _dsg_basic_amount(row) == 100
+
+
+def test_financial_breakdown_uses_channel_specific_columns_and_statuses(monkeypatch):
+    def record(**values):
+        return SimpleNamespace(upload_id="upload", amount="999", **values)
+
+    rows = {
+        DSGDatasetRow: [
+            record(order_number="D1", row_data={"Order Status": "Completed", "iteamcostxquantity": 100, "Order Shipping Amount": 10, "Cart Discount Amount": 5, "Taxable Value": 105, "Order Total Tax Amount": 18, "Order Total Amount": 123}),
+            record(order_number="D1", row_data={"Order Status": "Completed", "iteamcostxquantity": 50, "Order Shipping Amount": 10, "Cart Discount Amount": 2, "Taxable Value": 58, "Order Total Tax Amount": 18, "Order Total Amount": 123}),
+            record(order_number="D2", row_data={"Order Status": "Cancelled", "iteamcostxquantity": 900, "Taxable Value": 900, "Order Total Amount": 900}),
+        ],
+        SFHDatasetRow: [
+            record(row_data={"Invoice No.": "S1", "Earnings Currency": "₹", "Without Tax Total": 200, "Earnings": "$999", "Tax": 36}),
+            record(row_data={"Invoice No.": "S2", "Earnings Currency": "INR", "Without Tax Total": 800, "Earnings": "$50.25", "Tax": 99}),
+        ],
+        AmazonDatasetRow: [
+            record(row_data={"amazon-order-id": "A1", "order-status": "Shipped - Delivered to Buyer", "item-price": 300, "shipping-price": 20}),
+            record(row_data={"amazon-order-id": "A1", "order-status": "Shipped - Delivered to Buyer", "item-price": 100, "shipping-price": 20}),
+            record(row_data={"amazon-order-id": "A2", "order-status": "Shipped", "item-price": 700, "shipping-price": 30}),
+        ],
+        DirectSalesDatasetRow: [
+            record(order_number="I1", row_data={"Status": "Paid", "Without Tax Total": 60, "Discount": 10, "Tax": 18, "Total": 108}),
+            record(order_number="I1", row_data={"Status": "Paid", "Without Tax Total": 40, "Discount": 10, "Tax": 18, "Total": 108}),
+            record(order_number="I2", row_data={"Status": "Cancelled", "Without Tax Total": 500, "Discount": 0, "Tax": 90, "Total": 590}),
+        ],
+    }
+    monkeypatch.setattr("app.dashboard._cached_rows", lambda model: rows[model])
+    monkeypatch.setattr("app.dashboard._cached_upload_dates", lambda: {"upload": datetime(2026, 8, 1)})
+
+    result = _financial_breakdown("monthly", "8", 2026)
+
+    assert result["DSG"] == {"basic_value": 150, "shipping": 10, "discount": 7, "taxable_value": 153, "total_tax": 18, "total_sale": 171}
+    assert result["SFH"] == {"basic_value": 250.25, "shipping": 0, "discount": 0, "taxable_value": 250.25, "total_tax": 36, "total_sale": 286.25}
+    assert result["Amazon"] == {"basic_value": 400, "shipping": 40, "discount": 0, "taxable_value": 440, "total_tax": 0, "total_sale": 440}
+    assert result["Direct Sales"] == {"basic_value": 100, "shipping": 0, "discount": 0, "taxable_value": 100, "total_tax": 18, "total_sale": 108}
+
+
 def test_dsg_summary_invoice_value_is_taxable_value_plus_tax():
     first = _dsg_summary_row("ORD-1", "Completed", "Book A", 100, 1, 25, 0, 18)
     second = _dsg_summary_row("ORD-1", "Completed", "Book B", 200, 1, 25, 0, 18)
@@ -256,9 +329,9 @@ def _amazon_summary_row(order, status, product, quantity, item_price, shipping):
 
 def test_amazon_summary_excludes_cancelled_and_calculates_without_tax_or_discount():
     rows = [
-        ("Amazon", _amazon_summary_row("AMZ-1", "Shipped", "Book A", 2, 500, 40), "2026-08"),
+        ("Amazon", _amazon_summary_row("AMZ-1", "Shipped - Delivered to Buyer", "Book A", 2, 500, 40), "2026-08"),
         ("Amazon", _amazon_summary_row("AMZ-2", "Cancelled", "Book B", 1, 999, 50), "2026-08"),
-        ("Amazon", _amazon_summary_row("AMZ-3", "Pending", "Book C", 3, 300, 0), "2026-08"),
+        ("Amazon", _amazon_summary_row("AMZ-3", "Shipped - Delivered to Buyer", "Book C", 3, 300, 0), "2026-08"),
     ]
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -308,7 +381,7 @@ def test_unique_order_count_uses_channel_rules_and_amazon_exclusions():
     cancelled = _dsg_summary_row("DSG-X", "Cancelled", "B", 1, 1, 0, 0, 0)
     sfh = _sfh_summary_row("SAME-ID", "INR", "Course", 1, 1, 0)
     returning = _amazon_summary_row("AMZ-X", "Shipped - Returning to Seller", "A", 1, 1, 0)
-    shipped = _amazon_summary_row("AMZ-OK", "Shipped", "B", 1, 1, 0)
+    shipped = _amazon_summary_row("AMZ-OK", "Shipped - Delivered to Buyer", "B", 1, 1, 0)
     rows = [
         ("DSG", completed, "2026-08"), ("DSG", completed, "2026-08"),
         ("DSG", cancelled, "2026-08"), ("SFH", sfh, "2026-08"),
@@ -318,6 +391,32 @@ def test_unique_order_count_uses_channel_rules_and_amazon_exclusions():
 
     assert _unique_order_count(rows) == 3
     assert _amazon_is_cancelled(returning) is True
+
+
+def test_amazon_zero_item_price_is_excluded_from_orders_and_reports():
+    zero_price = _amazon_summary_row("AMZ-ZERO", "Shipped - Delivered to Buyer", "Free item", 1, 0, 50)
+    na_price = _amazon_summary_row("AMZ-NA", "Shipped - Delivered to Buyer", "Unavailable item", 1, "N/A", 0)
+    wrong_status = _amazon_summary_row("AMZ-SHIPPED", "Shipped", "Undelivered item", 1, 200, 0)
+    paid = _amazon_summary_row("AMZ-PAID", "Shipped - Delivered to Buyer", "Paid item", 1, 125, 0)
+    rows = [
+        ("Amazon", zero_price, "2026-08"),
+        ("Amazon", na_price, "2026-08"),
+        ("Amazon", wrong_status, "2026-08"),
+        ("Amazon", paid, "2026-08"),
+    ]
+
+    assert _amazon_is_excluded(zero_price) is True
+    assert _amazon_is_excluded(na_price) is True
+    assert _amazon_is_excluded(wrong_status) is True
+    assert _unique_order_count(rows) == 1
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    _append_amazon_summary_sheet(workbook, rows, "Aug - 26 Amazon Sales")
+    sheet = workbook["Amazon"]
+    assert sheet.max_row == 4
+    assert sheet.cell(3, 4).value == "AMZ-PAID"
+    assert sheet.cell(3, 13).value == 125
 
 
 def test_direct_sales_summary_maps_fields_and_allocates_invoice_values_without_duplication():
@@ -425,14 +524,17 @@ def test_direct_sales_overview_reuses_dashboard_mapping_and_reconciles():
         database,
         years={2026},
         months={4},
-        types={"Bulk", "Retail", "Stall"},
+        types={"Bulk", "In Office", "Stall"},
         products=set(),
     )
 
     assert result["validated"] is True
-    assert result["totals"] == {"Bulk": 101, "Retail": 50, "Stall": 25, "Language Lab": 0}
+    assert result["totals"] == {
+        "In Office": 50, "Stall": 25, "Bulk": 101,
+        "Call": 0, "Retail": 0, "Language Lab": 0,
+    }
     assert result["overall_total"] == 176
-    assert {row["type"] for row in result["rows"]} == {"Bulk", "Retail", "Stall"}
+    assert {row["type"] for row in result["rows"]} == {"Bulk", "In Office", "Stall"}
 
 
 def test_direct_sales_overview_reconciles_type_totals_to_overall_total():
@@ -448,7 +550,7 @@ def test_direct_sales_overview_reconciles_type_totals_to_overall_total():
 
     result = _build_direct_sales_overview(
         database,
-        years={2026}, months={4}, types={"Bulk", "Retail", "Stall"}, products=set(),
+        years={2026}, months={4}, types={"Bulk", "In Office", "Stall"}, products=set(),
     )
 
     assert result["overall_total"] == 112062
@@ -469,6 +571,36 @@ def test_direct_sales_overview_separates_language_lab_from_retail():
     assert result["totals"]["Language Lab"] == 48814
     assert result["totals"]["Retail"] == 0
     assert result["overall_total"] == 48814
+
+
+def test_direct_sales_overview_exposes_call_retail_and_in_office_separately():
+    database = _OverviewDatabase(
+        [
+            _direct_row(1, "I-1", "Office Book", 100, 1),
+            _direct_row(2, "C-1", "Call Book", 200, 1, "phone call"),
+            _direct_row(3, "R-1", "Retail Book", 300, 1, "Vedanta"),
+        ],
+        [SimpleNamespace(upload_id="upload-1", uploaded_at=None)],
+    )
+
+    result = _build_direct_sales_overview(
+        database,
+        years={2026}, months={4},
+        types={"In Office", "Call", "Retail"}, products=set(),
+    )
+
+    assert result["totals"] == {
+        "In Office": 100, "Stall": 0, "Bulk": 0,
+        "Call": 200, "Retail": 300, "Language Lab": 0,
+    }
+
+
+def test_channel_performance_keeps_call_and_retail_separate():
+    assert _direct_sales_channel(_direct_row(1, "C-1", "Call", 100, 1, "phone call")) == "Call"
+    assert _direct_sales_channel(_direct_row(2, "R-1", "Retail", 100, 1, "Vedanta")) == "Retail"
+    assert _direct_sales_channel(_direct_row(5, "R-2", "Retail Bulk Qty", 100, 25, "Vedanta")) == "Retail"
+    assert _direct_sales_channel(_direct_row(3, "S-1", "Stall", 100, 1, "stall")) == "Stall"
+    assert _direct_sales_channel(_direct_row(4, "B-1", "Bulk", 100, 11)) == "Bulk"
 
 
 def test_direct_sales_overview_rejects_duplicate_source_rows():
