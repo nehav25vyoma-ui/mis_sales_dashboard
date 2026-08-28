@@ -70,13 +70,18 @@ def _sales_classification(private_notes: object, quantity: object) -> str:
     if "language lab" in notes:
         return "Language Lab"
     if "stall" in notes:
-        return "Stall Sales"
+        return "Stall"
+    # Vedanta invoices always remain Retail; Bulk quantity does not apply.
+    if "vedanta" in notes:
+        return "Retail"
     try:
         if float(quantity) > 10:
-            return "Bulk Sales"
+            return "Bulk"
     except (TypeError, ValueError):
         pass
-    return "Direct Sales"
+    if any(term in notes for term in ("phone", "ph no", "call")):
+        return "Call"
+    return "In Office"
 
 
 async def _validated_file(file: UploadFile, dataset_label: str) -> tuple[str, bytes, pd.DataFrame]:
@@ -232,6 +237,7 @@ async def upload_direct_sales(
             prepared[inventory_columns["Quantity"]], errors="coerce"
         ).fillna(0)
         total_quantity = float(prepared["_quantity"].sum())
+        bulk_classification_quantity = float(prepared["_quantity"].max())
         product_parts: list[dict[str, object]] = []
         for source_index, inventory_row in prepared.iterrows():
             inventory_amount = (
@@ -271,6 +277,7 @@ async def upload_direct_sales(
                 else 1 / max(len(product_parts), 1)
             )
             part["total_quantity"] = total_quantity
+            part["bulk_classification_quantity"] = bulk_classification_quantity
         allocations[str(key)] = product_parts
 
     # Split only genuinely mixed-category invoices. The allocated values always
@@ -303,8 +310,9 @@ async def upload_direct_sales(
             row["Inventory Source Row"] = part["inventory_source_row"]
             row["Inventory Line Amount"] = part["inventory_amount"]
             row["Mapped Quantity"] = part["total_quantity"]
+            row["Bulk Classification Quantity"] = part["bulk_classification_quantity"]
             row["Sales Classification"] = _sales_classification(
-                row[invoice_columns["Private Notes"]], part["total_quantity"]
+                row[invoice_columns["Private Notes"]], part["bulk_classification_quantity"]
             )
             allocated_rows.append(row)
     matched = pd.DataFrame(allocated_rows)

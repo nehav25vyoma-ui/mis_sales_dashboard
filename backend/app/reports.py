@@ -12,9 +12,10 @@ from openpyxl.utils import get_column_letter
 
 from app.calculations.amounts import sfh_amount_from_record, sfh_is_inr_currency, whole_number
 from app.dashboard import (
+    _direct_bulk_invoice_ids,
     _direct_amount,
-    _direct_sales_channel,
-    _amazon_is_cancelled,
+    _dsg_basic_amount,
+    _amazon_is_excluded,
     _dsg_is_completed,
     _for_period,
     _load_channel_metrics,
@@ -64,12 +65,41 @@ INDIAN_STATE_NAMES = {
     "UK": "Uttarakhand", "UT": "Uttarakhand", "WB": "West Bengal",
 }
 DIRECT_OVERVIEW_TYPES = {
-    "Bulk Sales": "Bulk",
-    "Direct Sales": "Retail",
-    "Stall Sales": "Stall",
+    "Bulk": "Bulk",
+    "In Office": "In Office",
+    "Call": "Call",
+    "Retail": "Retail",
+    "Stall": "Stall",
     "Language Lab": "Language Lab",
 }
-DIRECT_OVERVIEW_TYPE_ORDER = ("Bulk", "Retail", "Stall", "Language Lab")
+DIRECT_OVERVIEW_TYPE_ORDER = (
+    "In Office", "Stall", "Bulk", "Call", "Retail", "Language Lab",
+)
+
+
+def _direct_overview_type(
+    row: DirectSalesDatasetRow,
+    invoice_is_bulk: bool | None = None,
+) -> str:
+    """Return the detailed five-way mapping used only by Report Center."""
+    notes = str(_row_value(row.row_data, ("private notes",)) or "").casefold()
+    if "language lab" in notes:
+        return "Language Lab"
+    if "stall" in notes:
+        return "Stall"
+    if "vedanta" in notes:
+        return "Retail"
+    if invoice_is_bulk is True or (
+        invoice_is_bulk is None
+        and _number(_row_value(
+            row.row_data,
+            ("bulk classification quantity", "category quantity", "mapped quantity"),
+        )) > 10
+    ):
+        return "Bulk"
+    if any(term in notes for term in ("phone", "ph no", "call")):
+        return "Call"
+    return "In Office"
 
 
 def _channel_display_name(channel: str) -> str:
@@ -128,7 +158,7 @@ def _filtered_rows(database, grain: str, period: str, year: int):
         for row in database.query(model).all():
             if channel == "DSG" and not _dsg_is_completed(row):
                 continue
-            if channel == "Amazon" and _amazon_is_cancelled(row):
+            if channel == "Amazon" and _amazon_is_excluded(row):
                 continue
             month_key = _month(row.row_data, upload_dates.get(row.upload_id, fallback))
             if _matches(month_key, grain, period, year):
@@ -137,6 +167,8 @@ def _filtered_rows(database, grain: str, period: str, year: int):
 
 
 def _amount(channel: str, row) -> float:
+    if channel == "DSG":
+        return _dsg_basic_amount(row)
     if channel == "SFH":
         return _number(sfh_amount_from_record(row.row_data))
     if channel == "Direct Sales":
@@ -188,7 +220,9 @@ def _direct_overview_source(database):
     fallback = datetime.now()
     source = []
     seen_ids = set()
-    for row in database.query(DirectSalesDatasetRow).all():
+    direct_rows = database.query(DirectSalesDatasetRow).all()
+    bulk_invoices = _direct_bulk_invoice_ids(direct_rows)
+    for row in direct_rows:
         if row.id in seen_ids:
             raise HTTPException(status_code=500, detail="Duplicate Direct Sales database row detected.")
         seen_ids.add(row.id)
@@ -198,7 +232,10 @@ def _direct_overview_source(database):
             "id": row.id,
             "year": row_year,
             "month": row_month,
-            "type": DIRECT_OVERVIEW_TYPES[_direct_sales_channel(row)],
+            "type": _direct_overview_type(
+                row,
+                _order_identifier("Direct Sales", row) in bulk_invoices,
+            ),
             "product": str(row.product_name or "Unmapped").strip() or "Unmapped",
             "order": _order_identifier("Direct Sales", row),
             "quantity": _quantity("Direct Sales", row),
@@ -351,6 +388,57 @@ def _style_sheet(sheet, title: str | None = None) -> None:
         sheet.column_dimensions[get_column_letter(column_index)].width = min(max(map(len, values)) + 3, 45)
 
 
+def _apply_workbook_theme(workbook: Workbook) -> None:
+    """Apply the shared MIS theme without changing workbook values or formulas."""
+    title_fill = PatternFill("solid", fgColor="4F51BF")
+    header_fill = PatternFill("solid", fgColor="E4E6FF")
+    alternate_fill = PatternFill("solid", fgColor="F8F9FF")
+    total_fill = PatternFill("solid", fgColor="D9DCFF")
+    thin_side = Side(style="thin", color="D9DCEC")
+    border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    for sheet in workbook.worksheets:
+        sheet.sheet_view.showGridLines = False
+        merged_top_rows = {
+            merged.min_row
+            for merged in sheet.merged_cells.ranges
+            if merged.min_row == merged.max_row and merged.min_col == 1
+        }
+        header_row = 3 if 2 in merged_top_rows else 2 if 1 in merged_top_rows else 1
+        if 1 in merged_top_rows:
+            title = sheet.cell(1, 1)
+            title.fill = title_fill
+            title.font = Font(name="Aptos Display", size=16, bold=True, color="FFFFFF")
+            title.alignment = Alignment(horizontal="left", vertical="center")
+            sheet.row_dimensions[1].height = 30
+        for cell in sheet[header_row]:
+            cell.fill = header_fill
+            cell.font = Font(name="Aptos", size=10, bold=True, color="25285F")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+        sheet.row_dimensions[header_row].height = max(sheet.row_dimensions[header_row].height or 15, 28)
+
+        for row_number in range(header_row + 1, sheet.max_row + 1):
+            values = [str(cell.value or "").strip().casefold() for cell in sheet[row_number]]
+            is_total = any(value in {"total", "total sales", "grand total"} for value in values)
+            fill = total_fill if is_total else alternate_fill if row_number % 2 else PatternFill("solid", fgColor="FFFFFF")
+            for cell in sheet[row_number]:
+                cell.fill = fill
+                cell.border = border
+                cell.font = Font(
+                    name="Aptos", size=10, bold=is_total,
+                    color="30339B" if is_total else "30384F",
+                )
+                cell.alignment = Alignment(vertical="center", wrap_text=False)
+            if is_total:
+                sheet.row_dimensions[row_number].height = 23
+
+        for column_index in range(1, sheet.max_column + 1):
+            letter = get_column_letter(column_index)
+            current_width = sheet.column_dimensions[letter].width or 10
+            sheet.column_dimensions[letter].width = min(max(current_width, 11), 45)
+
+
 def _reconciled_whole_numbers(values: list[float], target: int | None = None) -> list[int]:
     """Round visible rows while preserving the rounded aggregate total."""
     displayed = [whole_number(value) for value in values]
@@ -465,11 +553,7 @@ def _append_dsg_summary_sheet(workbook: Workbook, rows, label: str) -> None:
         first_order_row = order_key not in charged_orders
         if first_order_row:
             charged_orders.add(order_key)
-        basic_value = _number(
-            _row_value(data, ("item cost × quantity", "item cost x quantity"))
-            if _row_value(data, ("item cost × quantity", "item cost x quantity")) is not None
-            else row.amount
-        )
+        basic_value = _dsg_basic_amount(row)
         shipping = _number(_row_value(data, ("order shipping amount",))) if first_order_row else 0.0
         discount = _number(_row_value(data, ("cart discount amount",)))
         total_tax = _number(_row_value(data, ("order total tax amount",))) if first_order_row else 0.0
@@ -590,7 +674,7 @@ def _append_amazon_summary_sheet(workbook: Workbook, rows, label: str) -> None:
         "Basic Value", "Shipping", "Discount", "Taxable Value",
         "Total Tax", "Total Invoice Value",
     ])
-    valid_rows = [item for item in rows if not _amazon_is_cancelled(item[1])]
+    valid_rows = [item for item in rows if not _amazon_is_excluded(item[1])]
     for index, (_, row, month_key) in enumerate(valid_rows, 1):
         data = row.row_data
         year, month = _report_year_month(month_key)
@@ -723,6 +807,27 @@ def _summary_gst(channel: str, rows) -> float:
     return total
 
 
+def _direct_summary_values(rows) -> dict[str, float]:
+    """Build Direct summary buckets from the same rows shown on its detail sheet."""
+    values: defaultdict[str, float] = defaultdict(float)
+    for _, row, _ in rows:
+        amount = _direct_amount(row)
+        if amount == 0:
+            continue
+        category = str(
+            row.category or _row_value(row.row_data, ("category",)) or ""
+        ).strip()
+        if category == "Books":
+            values["exempted"] += amount
+        else:
+            # Direct Sales are domestic. Every non-book amount displayed as a
+            # Taxable Value on the detail sheet belongs in the taxable bucket,
+            # including reviewed N/A rows.
+            values["taxable"] += amount
+        values["pnl"] += amount
+    return values
+
+
 def _summary_workbook(rows, grain: str, period: str, year: int) -> Workbook:
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -753,7 +858,13 @@ def _summary_workbook(rows, grain: str, period: str, year: int) -> Workbook:
         channel_rows = [item for item in rows if item[0] == channel_name]
         if not channel_rows:
             continue
-        values = _for_period(metrics.get(metric_key, {}), grain, period, year) if metric_key in metrics else defaultdict(float)
+        values = (
+            _direct_summary_values(channel_rows)
+            if channel_name == "Direct Sales"
+            else _for_period(metrics.get(metric_key, {}), grain, period, year)
+            if metric_key in metrics
+            else defaultdict(float)
+        )
         amounts = [
             _unique_order_count(channel_rows),
             values["zero_rated"],
@@ -1170,21 +1281,80 @@ def download_direct_sales_overview(
             types=set(types),
             products=set(products or []),
         )
-    output = StringIO()
-    writer = csv.writer(output, lineterminator="\n")
-    writer.writerow(["Year", "Month", "Type", "Product", "Orders", "Invoice Qty (Classification)", "Product Quantity", "Without Tax Total"])
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Direct Sales Overview"
+    headers = ["Year", "Month", "Type", "Product", "Orders", "Invoice Qty (Classification)", "Product Quantity", "Without Tax Total"]
+    sheet.merge_cells("A1:H1")
+    sheet["A1"] = "Direct Sales Overview"
+    sheet["A1"].font = Font(name="Aptos Display", size=18, bold=True, color="FFFFFF")
+    sheet["A1"].alignment = Alignment(horizontal="left", vertical="center")
+    sheet["A1"].fill = PatternFill("solid", fgColor="4F51BF")
+    sheet.row_dimensions[1].height = 32
+    sheet.merge_cells("A2:H2")
+    sheet["A2"] = "Filtered and reconciled Direct Sales classification report"
+    sheet["A2"].font = Font(name="Aptos", size=10, italic=True, color="59627A")
+    sheet["A2"].fill = PatternFill("solid", fgColor="F1F2FF")
+    sheet["A2"].alignment = Alignment(vertical="center")
+    sheet.append(headers)
+    header_fill = PatternFill("solid", fgColor="E4E6FF")
+    header_font = Font(name="Aptos", size=10, bold=True, color="25285F")
+    thin_side = Side(style="thin", color="D9DCEC")
+    grid_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    for cell in sheet[3]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = grid_border
+    sheet.row_dimensions[3].height = 30
     for row in result["rows"]:
-        writer.writerow([
+        sheet.append([
             row["year"], row["month"], row["type"], row["product"],
-            _indian_integer(row["orders"]),
-            _indian_integer(row["invoice_quantity"]),
-            _indian_integer(row["quantity"]),
-            _indian_integer(row["without_tax_total"]),
+            row["orders"], row["invoice_quantity"], row["quantity"],
+            row["without_tax_total"],
         ])
-    filename = f"direct-sales-overview-{'-'.join(map(str, sorted(set(years))))}.csv"
-    return Response(
-        content="\ufeff" + output.getvalue(),
-        media_type="text/csv; charset=utf-8",
+    first_data_row = 4
+    last_data_row = sheet.max_row
+    for row_number in range(first_data_row, last_data_row + 1):
+        fill = PatternFill("solid", fgColor="FFFFFF" if row_number % 2 == 0 else "F8F9FF")
+        for cell in sheet[row_number]:
+            cell.fill = fill
+            cell.border = grid_border
+            cell.font = Font(name="Aptos", size=10, color="30384F")
+            cell.alignment = Alignment(vertical="center", horizontal="left" if cell.column in {2, 3, 4} else "right")
+        for column in range(5, 9):
+            sheet.cell(row_number, column).number_format = INDIAN_WHOLE_NUMBER_FORMAT
+    grand_total_row = sheet.max_row + 1
+    sheet.merge_cells(start_row=grand_total_row, start_column=1, end_row=grand_total_row, end_column=7)
+    sheet.cell(grand_total_row, 1, "Grand Total")
+    sheet.cell(
+        grand_total_row,
+        8,
+        f"=SUBTOTAL(109,H{first_data_row}:H{last_data_row})"
+        if last_data_row >= first_data_row else 0,
+    )
+    for cell in sheet[grand_total_row]:
+        cell.fill = PatternFill("solid", fgColor="D9DCFF")
+        cell.font = Font(name="Aptos", size=11, bold=True, color="30339B")
+        cell.border = grid_border
+        cell.alignment = Alignment(horizontal="right", vertical="center")
+    sheet.cell(grand_total_row, 8).number_format = INDIAN_WHOLE_NUMBER_FORMAT
+    sheet.row_dimensions[grand_total_row].height = 24
+    sheet.freeze_panes = "A4"
+    if last_data_row >= first_data_row:
+        sheet.auto_filter.ref = f"A3:H{last_data_row}"
+    for column, width in {"A": 11, "B": 12, "C": 18, "D": 34, "E": 12, "F": 26, "G": 18, "H": 22}.items():
+        sheet.column_dimensions[column].width = width
+    sheet.sheet_view.showGridLines = False
+    workbook.properties.title = "Direct Sales Overview"
+    _apply_workbook_theme(workbook)
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    filename = f"direct-sales-overview-{'-'.join(map(str, sorted(set(years))))}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -1216,6 +1386,7 @@ def download_report(
         if report_type == "summary"
         else _performance_workbook(rows, report_type, grain, period, year)
     )
+    _apply_workbook_theme(workbook)
     output = BytesIO()
     workbook.save(output)
     output.seek(0)

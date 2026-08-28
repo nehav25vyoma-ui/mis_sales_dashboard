@@ -814,3 +814,325 @@ Arrange the KPI cards in this order:
 3. Taxable Sales
 4. Foreign Sales
 5. Total Orders
+
+
+44. DASHBOARD PLACEMENT AND ALIGNMENT
+-------------------------------------
+
+All should be properly placed and aligned.
+
+
+45. KPI COMPARISON BADGE ALIGNMENT
+----------------------------------
+
+The green comparison badges are not aligned properly. Align them consistently
+across the KPI cards.
+
+
+46. PLAN UPDATION
+-----------------
+
+Add a new “Plan Updation” option in the left-side menu.
+
+Yearly Plan Management:
+
+- Plans should be maintained separately for each year.
+- The existing 2026 plan must remain unchanged when a new year's plan is added
+  or updated.
+- Support future years such as 2027 and 2028.
+
+Year Selection:
+
+- Show a Year Selection option first.
+- After selecting the year, allow monthly plan entry and updates.
+
+Provide separate channel-wise monthly plans for DSG, SFH, Amazon, Direct Sales,
+OTT, and Language Lab.
+
+Automatically calculate quarterly and yearly plans from the monthly plan. Do
+not manually enter quarterly or yearly plans. Quarterly is monthly multiplied
+by 3 and yearly is monthly multiplied by 12.
+
+Dashboard Integration:
+
+- Use the plan for the selected year.
+- Month, quarter, and year filters must display the corresponding calculated
+  plan.
+- Respect the selected channel and time period.
+
+Delete Option:
+
+- Enable Delete only when a saved Year + Channel plan exists.
+- Ask for confirmation before deletion.
+- Delete only the selected Year + Channel record.
+- Do not affect 2026 or any other year/channel.
+- Allow a deleted plan to be added again.
+
+Preserve Existing Plans:
+
+- Do not overwrite, modify, or delete the existing 2026 plan.
+- Store new plans separately by Year + Channel.
+
+Database:
+
+- Use a separate plan table containing Year, Channel, and Monthly Plan.
+- Dynamically calculate monthly, selected-period, quarterly, and yearly plans.
+- Enforce one record per Year + Channel and update the existing record instead
+  of inserting a duplicate.
+
+UI:
+
+- Keep the dashboard design and functionality unchanged.
+- Add only the Plan Updation menu and plan-management page.
+- Provide clear Save/Update and Delete actions.
+- Show success feedback after saving or updating.
+- Refresh plan values after deletion without affecting other years.
+
+
+47. DASHBOARD VALUES AFTER PLAN DELETION
+----------------------------------------
+
+After updating and then deleting a plan, the dashboard visual values are not
+displaying. Restore the correct visual values after plan deletion.
+
+
+48. CATEGORY AND CHANNEL PLAN UPDATION
+--------------------------------------
+
+Plan Updation should support both Category Plan Updation and Channel Plan
+Updation.
+
+
+49. CHANNEL PERFORMANCE PLAN NOT UPDATED
+----------------------------------------
+
+The 2027 plan has been updated, but the Channel Wise Performance visual is not
+updating properly. Identify and explain the cause.
+
+
+50. PLAN UPDATION STATUS
+------------------------
+
+Confirm whether Plan Updation was changed to use the Channel Wise Performance
+names.
+
+
+51. USE CHANNEL PERFORMANCE NAMES FOR PLANS
+-------------------------------------------
+
+Update Channel Plan Updation to use these exact Channel Wise Performance
+names:
+
+- Digital Online
+- Stall Sales
+- Direct Sales
+- Bulk Sales
+- Language Lab
+- OTT
+
+
+52. PRESERVE UNSAVED PLAN VALUES
+--------------------------------
+
+When one Channel or Category plan is saved, some other entered plan values
+reset to zero. Fix both plan types so saving one record does not reset other
+draft values. After saving, change the button label from “Update” to “Updated.”
+
+
+53. TOTAL SALES KPI COMPARISON EXPLANATION
+------------------------------------------
+
+Explain how the comparison is updated in the Total Sales KPI card.
+
+
+54. VERIFY AND UPDATE TOTAL SALES COMPARISON
+--------------------------------------------
+
+Check whether the Total Sales KPI comparison is updating correctly and fix it
+where necessary.
+
+
+55. FIVE-SECOND CROSS-DEVICE LOADING TARGET
+-------------------------------------------
+
+Overall loading time should be less than five seconds on the same device and
+on different devices.
+
+
+56. VISUAL-SPECIFIC FILTERS
+---------------------------
+
+Dashboard visual filters should affect only their own visual. Update this
+without changing any other functionality, calculation, or business logic.
+
+
+57. FILTER HIERARCHY AND NAVIGATION
+-----------------------------------
+
+Update dashboard navigation and filtering without changing calculations or
+business logic:
+
+- The global filter must apply to every dashboard button/page and visual.
+- Each page should initially inherit the global filter.
+- A page-specific override must affect only that page, not other pages.
+- Returning to the global/overview page must reset the page override so it
+  inherits the global filter again.
+- A visual-specific filter must affect only that visual.
+
+
+58. RESET VISUAL FILTERS ON TAB RETURN
+--------------------------------------
+
+When navigating from the first dashboard button to another tab and then back,
+reset its visual-specific filters to the current All Channels/global filter.
+Do not change any other functionality, calculation, or business logic.
+
+
+59. FINANCIAL BREAKDOWN HORIZONTAL GRAPH
+----------------------------------------
+
+Update the horizontal line graph accurately only in Financial Breakdown. Do
+not change any other functionality, calculation, visual, or business logic.
+
+
+60. FINANCIAL BREAKDOWN TABLE BORDERS
+-------------------------------------
+
+Update the row and column borders in Financial Breakdown.
+
+
+61. CHANNEL-WISE PERFORMANCE DIRECT SALES SPLIT
+------------------------------------------------
+
+Update only Channel-wise Performance so Direct Sales is split, after Digital
+Online, into In Office, Stall, Bulk, Call, and Retail. Match the Invoice and
+Sales Inventory datasets by mapped Invoice Number without duplicating sales.
+Classify each invoice once using this priority: Stall, invoice-wise summed Qty
+greater than 10 as Bulk, phone/ph no/call as Call, Vedanta as Retail, and In
+Office as the default. Keep Digital Online and all other channel logic
+unchanged. Use monthly plans of ₹50,000 for In Office, Stall, and Bulk, and
+₹25,000 for Call and Retail with the existing year and period calculations.
+
+
+62. REPORT CENTER DIRECT SALES OVERVIEW SPLIT
+---------------------------------------------
+
+Update the Report Center Direct Sales Overview to use the same Direct Sales
+sub-channel classification as Channel-wise Performance without changing any
+other functionality or business logic.
+
+
+63. THREE-WAY CHANNEL PERFORMANCE WITH DETAILED REPORT
+------------------------------------------------------
+
+In Channel-wise Performance, show Direct Sales only as In Office, Stall, and
+Bulk. Keep the existing Stall and Bulk calculations and include Call, Retail,
+and every other unmatched Direct Sales transaction in In Office. Use monthly
+plans of ₹1,00,000 for In Office and ₹50,000 each for Stall and Bulk. Keep the
+Report Center Direct Sales Overview detailed as In Office, Stall, Bulk, Call,
+and Retail without changing other functionality or logic.
+
+
+64. CLARIFY DIRECT SALES REPORT QUANTITIES
+------------------------------------------
+
+Make Invoice Qty (Classification) less confusing because it is currently
+shown for other Direct Sales types as well. Show the invoice-level quantity
+only where it is relevant to Bulk classification, while retaining Product
+Quantity for every report type.
+
+
+65. REVERT REPORT QUANTITY PRESENTATION
+---------------------------------------
+
+Remove the most recent Direct Sales report quantity presentation update and
+restore the previous Invoice Qty (Classification) behavior.
+
+
+66. REVERT CHANNEL PERFORMANCE CONSOLIDATION
+--------------------------------------------
+
+Revert the most recent Channel-wise Performance update and restore the
+previous detailed Direct Sales split and plans.
+
+
+67. BULK BY MAPPED INVOICE QUANTITY
+-----------------------------------
+
+For Bulk, group Sales Inventory records by mapped Invoice Number, sum their
+quantities, and classify the invoice as Bulk only when its summed quantity is
+greater than 10.
+
+
+68. BULK BY INDIVIDUAL INVENTORY QUANTITY
+-----------------------------------------
+
+Keep Bulk invoice-number based, but classify the mapped invoice as Bulk only
+when an individual Sales Inventory Qty is greater than 10. Do not classify it
+as Bulk merely because several smaller quantities sum to more than 10. Do not
+change any other functionality or logic.
+
+
+69. RETAIL EXEMPTION FROM BULK
+------------------------------
+
+For Retail only, do not apply the Bulk quantity calculation. A Vedanta
+transaction should remain Retail even when its individual inventory quantity
+is greater than 10. Do not change other functionality or logic.
+
+
+70. DIRECT SALES OVERVIEW GRAND TOTAL
+-------------------------------------
+
+Add a Grand Total row at the end of the Direct Sales Overview report.
+
+
+71. DIRECT SALES OVERVIEW SCREEN THEME
+--------------------------------------
+
+Update the Report Center screen theme for Direct Sales Overview without
+changing its filters, calculations, downloads, or other application screens.
+
+
+72. DIRECT SALES OVERVIEW EXCEL THEME
+-------------------------------------
+
+Apply a theme to the downloaded Direct Sales Overview report as well, with a
+styled Excel layout while preserving its data and calculations.
+
+
+73. SHARED THEME FOR ALL REPORTS
+--------------------------------
+
+Apply the same Excel theme to all Report Center downloads without changing
+their data, formulas, sheets, filters, or calculations.
+
+
+74. AMAZON CUSTOMER PERFORMANCE POPUP
+-------------------------------------
+
+When Customer Performance is clicked while Amazon is selected, show “No
+customer performance details available for Amazon.” and do not open the page
+or table. Keep Customer Performance unchanged for every other channel.
+
+
+75. CUSTOMER PERFORMANCE BLANK TAB FIX
+--------------------------------------
+
+Check and fix the Customer Performance tab when it displays no content, while
+preserving its existing functionality and the Amazon-only popup behavior.
+
+
+76. AMAZON POPUP ON CUSTOMER CHANNEL CHANGE
+-------------------------------------------
+
+Fix the missing Amazon popup in Customer Performance and ensure it appears
+both when opening Customer Performance with Amazon selected and when choosing
+Amazon from the Customer Performance channel selector.
+
+
+77. FILTER-AWARE DIRECT SALES GRAND TOTAL
+-----------------------------------------
+
+In the Direct Sales Overview Excel report, make the Grand Total dynamically
+recalculate and display the total of only the rows visible after filtering.
