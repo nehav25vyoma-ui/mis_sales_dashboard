@@ -57,7 +57,7 @@ class DirectSalesUploadTests(unittest.TestCase):
         self.assertEqual(list(frame["Mapped Quantity"]), [11.0, 11.0, 11.0, 11.0])
         self.assertEqual(
             list(frame["Sales Classification"]),
-            ["In Office", "In Office", "Stall", "Stall"],
+            ["Call", "Call", "Stall", "Stall"],
         )
         self.assertAlmostEqual(frame["Without Tax Total"].sum(), 300.0)
         product_totals = frame.groupby("Product Name")["Without Tax Total"].sum()
@@ -110,14 +110,20 @@ class DirectSalesUploadTests(unittest.TestCase):
         self.assertIn("Sales Inventory Dataset", str(raised.exception.detail))
 
     def test_sales_classification_is_mutually_exclusive_with_stall_precedence(self):
-        self.assertEqual(direct_sales._sales_classification("Language Lab order", 25), "Language Lab")
+        self.assertEqual(direct_sales._sales_classification("Language Lab order", 25), "Bulk")
         self.assertEqual(direct_sales._sales_classification("Annual STALL event", 25), "Stall")
         self.assertEqual(direct_sales._sales_classification("", 11), "Bulk")
         self.assertEqual(direct_sales._sales_classification("please call this phone", 10), "Call")
-        self.assertEqual(direct_sales._sales_classification("Vedanta", 10), "Retail")
-        self.assertEqual(direct_sales._sales_classification("Vedanta", 25), "Retail")
+        self.assertEqual(direct_sales._sales_classification("VENDANT", 10), "Retail")
+        self.assertEqual(direct_sales._sales_classification("vendant", 25), "Retail")
         self.assertEqual(direct_sales._sales_classification("", 10), "In Office")
-        self.assertEqual(direct_sales._sales_classification("Vedanta stall", 1), "Stall")
+        self.assertEqual(direct_sales._sales_classification("vendant stall", 1), "Stall")
+        self.assertEqual(direct_sales._sales_classification("Language Lab", 10), "Language Lab")
+        self.assertEqual(direct_sales._sales_classification("S101 course", 1), "Course Promotion")
+        self.assertEqual(direct_sales._sales_classification("grammar", 1), "In Office")
+        self.assertEqual(direct_sales._sales_classification("grammer", 1), "Course Promotion")
+        self.assertEqual(direct_sales._sales_classification(None, "", "  "), "In Office")
+        self.assertEqual(direct_sales._sales_classification("call language lab", 1), "Call")
 
 
 if __name__ == "__main__":

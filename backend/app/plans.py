@@ -10,14 +10,15 @@ from app.database.models import CategoryPlan, ChannelPlan
 
 router = APIRouter(prefix="/api/plans", tags=["plans"])
 
-PLAN_CHANNELS = ("Digital Online", "In Office", "Stall", "Bulk", "Call", "Retail", "Language Lab", "OTT")
+PLAN_CHANNELS = ("Digital Online", "In Office", "Stall", "Bulk", "Call", "Retail", "Course Promotion", "Language Lab", "OTT")
 DEFAULT_2026_PLANS = {
     "Digital Online": 300_000,
     "In Office": 50_000,
     "Stall": 50_000,
-    "Bulk": 50_000,
+    "Bulk": 25_000,
     "Call": 25_000,
     "Retail": 25_000,
+    "Course Promotion": 25_000,
     "Language Lab": 125_000,
     "OTT": 200_000,
 }

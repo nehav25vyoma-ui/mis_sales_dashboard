@@ -26,6 +26,7 @@ from app.dashboard import (
 )
 from app.database.database import SessionLocal
 from app.database.models import AmazonDatasetRow, DirectSalesDatasetRow, DSGDatasetRow, SFHDatasetRow, UploadHistory
+from app.direct_sales_classification import DIRECT_SALES_CLASSIFICATIONS, classify_direct_sale
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
@@ -64,42 +65,30 @@ INDIAN_STATE_NAMES = {
     "TG": "Telangana", "TR": "Tripura", "UP": "Uttar Pradesh",
     "UK": "Uttarakhand", "UT": "Uttarakhand", "WB": "West Bengal",
 }
-DIRECT_OVERVIEW_TYPES = {
-    "Bulk": "Bulk",
-    "In Office": "In Office",
-    "Call": "Call",
-    "Retail": "Retail",
-    "Stall": "Stall",
-    "Language Lab": "Language Lab",
-}
-DIRECT_OVERVIEW_TYPE_ORDER = (
-    "In Office", "Stall", "Bulk", "Call", "Retail", "Language Lab",
-)
+DIRECT_OVERVIEW_TYPES = {value: value for value in DIRECT_SALES_CLASSIFICATIONS}
+DIRECT_OVERVIEW_TYPE_ORDER = DIRECT_SALES_CLASSIFICATIONS
 
 
 def _direct_overview_type(
     row: DirectSalesDatasetRow,
     invoice_is_bulk: bool | None = None,
 ) -> str:
-    """Return the detailed five-way mapping used only by Report Center."""
-    notes = str(_row_value(row.row_data, ("private notes",)) or "").casefold()
-    if "language lab" in notes:
-        return "Language Lab"
-    if "stall" in notes:
-        return "Stall"
-    if "vedanta" in notes:
-        return "Retail"
-    if invoice_is_bulk is True or (
-        invoice_is_bulk is None
-        and _number(_row_value(
-            row.row_data,
-            ("bulk classification quantity", "category quantity", "mapped quantity"),
-        )) > 10
-    ):
+    """Return the Direct Sales Overview mapping for one product record."""
+    product_quantity = _row_value(
+        row.row_data,
+        ("category quantity", "bulk classification quantity"),
+    )
+    if _number(product_quantity) > 10:
         return "Bulk"
-    if any(term in notes for term in ("phone", "ph no", "call")):
-        return "Call"
-    return "In Office"
+    return classify_direct_sale(
+        (
+            _row_value(row.row_data, ("private notes",)),
+            row.product_name,
+            row.category,
+            _row_value(row.row_data, ("item details", "product name", "description")),
+        ),
+        product_quantity,
+    )
 
 
 def _channel_display_name(channel: str) -> str:
@@ -279,7 +268,16 @@ def _build_direct_sales_overview(
         grouped[key]["quantity"] += item["quantity"]
         grouped[key]["amount"] += item["amount"]
 
-    ordered = sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1], item[0][2], item[0][3].casefold()))
+    type_rank = {type_name: index for index, type_name in enumerate(DIRECT_OVERVIEW_TYPE_ORDER)}
+    ordered = sorted(
+        grouped.items(),
+        key=lambda item: (
+            item[0][0],
+            item[0][1],
+            type_rank[item[0][2]],
+            item[0][3].casefold(),
+        ),
+    )
     display_quantities = [0] * len(ordered)
     display_amounts = [0] * len(ordered)
     indexes_by_type = defaultdict(list)
@@ -326,8 +324,27 @@ def _build_direct_sales_overview(
     expected = {type_name: reconciled_type_totals[type_name] for type_name in type_order}
     if totals != expected:
         raise HTTPException(status_code=500, detail="Direct Sales Overview failed dashboard reconciliation.")
+    detail_rows = [
+        {
+            "year": item["year"],
+            "month": datetime(item["year"], item["month"], 1).strftime("%b"),
+            "invoice": item["order"],
+            "type": item["type"],
+            "product": item["product"],
+            "quantity": item["quantity"],
+            "without_tax_total": item["amount"],
+        }
+        for item in sorted(
+            filtered,
+            key=lambda item: (
+                item["year"], item["month"], type_rank[item["type"]],
+                item["product"].casefold(), item["order"], item["id"],
+            ),
+        )
+    ]
     return {
         "rows": rows,
+        "detail_rows": detail_rows,
         "row_count": len(rows),
         "source_records": len(filtered),
         "totals": totals,
@@ -360,6 +377,8 @@ def _with_tax_amount(channel: str, row) -> float:
 def _order_identifier(channel: str, row) -> str:
     if channel == "SFH":
         value = _row_value(row.row_data, ("invoice no.", "receipt no.", "reg. no."))
+    elif channel == "Amazon":
+        value = _row_value(row.row_data, ("amazon-order-id", "amazon order id"))
     else:
         value = getattr(row, "order_number", None) or _row_value(
             row.row_data, ("order number", "invoice number")
@@ -1263,7 +1282,7 @@ def preview_direct_sales_overview(
             types=set(types),
             products=set(products or []),
         )
-    return {key: value for key, value in result.items() if key != "rows"}
+    return {key: value for key, value in result.items() if key not in {"rows", "detail_rows"}}
 
 
 @router.get("/direct-sales-overview/download")
@@ -1284,14 +1303,14 @@ def download_direct_sales_overview(
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Direct Sales Overview"
-    headers = ["Year", "Month", "Type", "Product", "Orders", "Invoice Qty (Classification)", "Product Quantity", "Without Tax Total"]
-    sheet.merge_cells("A1:H1")
+    headers = ["Year", "Month", "Type", "Product", "Orders", "Product Quantity", "Without Tax Total"]
+    sheet.merge_cells("A1:G1")
     sheet["A1"] = "Direct Sales Overview"
     sheet["A1"].font = Font(name="Aptos Display", size=18, bold=True, color="FFFFFF")
     sheet["A1"].alignment = Alignment(horizontal="left", vertical="center")
     sheet["A1"].fill = PatternFill("solid", fgColor="4F51BF")
     sheet.row_dimensions[1].height = 32
-    sheet.merge_cells("A2:H2")
+    sheet.merge_cells("A2:G2")
     sheet["A2"] = "Filtered and reconciled Direct Sales classification report"
     sheet["A2"].font = Font(name="Aptos", size=10, italic=True, color="59627A")
     sheet["A2"].fill = PatternFill("solid", fgColor="F1F2FF")
@@ -1310,8 +1329,7 @@ def download_direct_sales_overview(
     for row in result["rows"]:
         sheet.append([
             row["year"], row["month"], row["type"], row["product"],
-            row["orders"], row["invoice_quantity"], row["quantity"],
-            row["without_tax_total"],
+            row["orders"], row["quantity"], row["without_tax_total"],
         ])
     first_data_row = 4
     last_data_row = sheet.max_row
@@ -1322,15 +1340,15 @@ def download_direct_sales_overview(
             cell.border = grid_border
             cell.font = Font(name="Aptos", size=10, color="30384F")
             cell.alignment = Alignment(vertical="center", horizontal="left" if cell.column in {2, 3, 4} else "right")
-        for column in range(5, 9):
+        for column in range(5, 8):
             sheet.cell(row_number, column).number_format = INDIAN_WHOLE_NUMBER_FORMAT
     grand_total_row = sheet.max_row + 1
-    sheet.merge_cells(start_row=grand_total_row, start_column=1, end_row=grand_total_row, end_column=7)
+    sheet.merge_cells(start_row=grand_total_row, start_column=1, end_row=grand_total_row, end_column=6)
     sheet.cell(grand_total_row, 1, "Grand Total")
     sheet.cell(
         grand_total_row,
-        8,
-        f"=SUBTOTAL(109,H{first_data_row}:H{last_data_row})"
+        7,
+        f"=SUBTOTAL(109,G{first_data_row}:G{last_data_row})"
         if last_data_row >= first_data_row else 0,
     )
     for cell in sheet[grand_total_row]:
@@ -1338,14 +1356,46 @@ def download_direct_sales_overview(
         cell.font = Font(name="Aptos", size=11, bold=True, color="30339B")
         cell.border = grid_border
         cell.alignment = Alignment(horizontal="right", vertical="center")
-    sheet.cell(grand_total_row, 8).number_format = INDIAN_WHOLE_NUMBER_FORMAT
+    sheet.cell(grand_total_row, 7).number_format = INDIAN_WHOLE_NUMBER_FORMAT
     sheet.row_dimensions[grand_total_row].height = 24
     sheet.freeze_panes = "A4"
     if last_data_row >= first_data_row:
-        sheet.auto_filter.ref = f"A3:H{last_data_row}"
-    for column, width in {"A": 11, "B": 12, "C": 18, "D": 34, "E": 12, "F": 26, "G": 18, "H": 22}.items():
+        sheet.auto_filter.ref = f"A3:G{last_data_row}"
+    for column, width in {"A": 11, "B": 12, "C": 18, "D": 34, "E": 12, "F": 18, "G": 22}.items():
         sheet.column_dimensions[column].width = width
     sheet.sheet_view.showGridLines = False
+
+    detail_sheet = workbook.create_sheet("Detailed Records")
+    detail_headers = ["Year", "Month", "Invoice", "Type", "Product", "Product Quantity", "Without Tax Total"]
+    detail_sheet.append(detail_headers)
+    for cell in detail_sheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = grid_border
+    detail_sheet.row_dimensions[1].height = 30
+    for detail in result["detail_rows"]:
+        detail_sheet.append([
+            detail["year"], detail["month"], detail["invoice"], detail["type"],
+            detail["product"], detail["quantity"], detail["without_tax_total"],
+        ])
+        row_number = detail_sheet.max_row
+        fill = PatternFill("solid", fgColor="FFFFFF" if row_number % 2 == 0 else "F8F9FF")
+        for cell in detail_sheet[row_number]:
+            cell.fill = fill
+            cell.border = grid_border
+            cell.font = Font(name="Aptos", size=10, color="30384F")
+            cell.alignment = Alignment(vertical="center", horizontal="left" if cell.column in {2, 3, 4, 5} else "right")
+        detail_sheet.cell(row_number, 6).number_format = INDIAN_WHOLE_NUMBER_FORMAT
+        detail_sheet.cell(row_number, 7).number_format = INDIAN_WHOLE_NUMBER_FORMAT
+    detail_sheet.freeze_panes = "A2"
+    if detail_sheet.max_row > 1:
+        detail_sheet.auto_filter.ref = f"A1:G{detail_sheet.max_row}"
+    for column, width in {"A": 11, "B": 12, "C": 20, "D": 20, "E": 38, "F": 18, "G": 22}.items():
+        detail_sheet.column_dimensions[column].width = width
+    detail_sheet.sheet_view.showGridLines = False
+    workbook.remove(sheet)
+    detail_sheet.title = "Direct Sales Overview"
     workbook.properties.title = "Direct Sales Overview"
     _apply_workbook_theme(workbook)
     output = BytesIO()

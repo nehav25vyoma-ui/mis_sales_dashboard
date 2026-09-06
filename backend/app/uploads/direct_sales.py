@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.database.database import SessionLocal
 from app.database.models import DirectSalesDatasetRow, UploadHistory
+from app.direct_sales_classification import classify_direct_sale
 from app.uploads.dsg import (
     ALLOWED_EXTENSIONS,
     CATEGORY_MAPPING,
@@ -65,23 +66,8 @@ def _invoice_key(value: object) -> str:
     return re.sub(r"\.0$", "", text)
 
 
-def _sales_classification(private_notes: object, quantity: object) -> str:
-    notes = str(private_notes).casefold()
-    if "language lab" in notes:
-        return "Language Lab"
-    if "stall" in notes:
-        return "Stall"
-    # Vedanta invoices always remain Retail; Bulk quantity does not apply.
-    if "vedanta" in notes:
-        return "Retail"
-    try:
-        if float(quantity) > 10:
-            return "Bulk"
-    except (TypeError, ValueError):
-        pass
-    if any(term in notes for term in ("phone", "ph no", "call")):
-        return "Call"
-    return "In Office"
+def _sales_classification(private_notes: object, quantity: object, *text_values: object) -> str:
+    return classify_direct_sale((private_notes, *text_values), quantity)
 
 
 async def _validated_file(file: UploadFile, dataset_label: str) -> tuple[str, bytes, pd.DataFrame]:
@@ -310,9 +296,12 @@ async def upload_direct_sales(
             row["Inventory Source Row"] = part["inventory_source_row"]
             row["Inventory Line Amount"] = part["inventory_amount"]
             row["Mapped Quantity"] = part["total_quantity"]
-            row["Bulk Classification Quantity"] = part["bulk_classification_quantity"]
+            row["Bulk Classification Quantity"] = part["quantity"]
             row["Sales Classification"] = _sales_classification(
-                row[invoice_columns["Private Notes"]], part["bulk_classification_quantity"]
+                row[invoice_columns["Private Notes"]],
+                part["quantity"],
+                part["product"],
+                part["category"],
             )
             allocated_rows.append(row)
     matched = pd.DataFrame(allocated_rows)
@@ -379,6 +368,13 @@ def get_unmatched(upload_id: str) -> dict[str, object]:
         "inventory_records": upload["unmatched_inventory"],
         "category_conflicts": upload["category_conflicts"],
     }
+
+
+@router.delete("/direct-sales/{upload_id}")
+def discard_upload(upload_id: str) -> dict[str, object]:
+    if DIRECT_SALES_UPLOAD_STORE.pop(upload_id, None) is None:
+        raise HTTPException(status_code=404, detail="Direct Sales upload session not found.")
+    return {"deleted": True, "upload_id": upload_id}
 
 
 @router.get("/direct-sales/{upload_id}/category-review")
