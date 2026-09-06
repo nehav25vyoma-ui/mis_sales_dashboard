@@ -203,9 +203,10 @@ const CHANNEL_MONTHLY_PLANS = {
   digitalOnline: 300000,
   inOffice: 50000,
   stall: 50000,
-  bulk: 50000,
+  bulk: 25000,
   call: 25000,
   retail: 25000,
+  coursePromotion: 25000,
   totalSales: 500000,
   languageLab: 125000,
   ott: 200000,
@@ -310,13 +311,46 @@ function Placeholder({ title }: { title: string }) {
 
 type ReportType = 'summary' | 'channel' | 'category' | 'product' | 'direct-sales-overview'
 
-function MultiCheckFilter({ label, options, selected, onChange }: { label: string; options: { value: string; label: string }[]; selected: string[]; onChange: (values: string[]) => void }) {
+function DirectOverviewFilter({ label, options, selected, onChange }: { label: string; options: { value: string; label: string }[]; selected: string[]; onChange: (values: string[]) => void }) {
+  const rootRef = useRef<HTMLDivElement>(null)
+  const [open, setOpen] = useState(false)
   const selectedSet = new Set(selected)
-  return <fieldset className="multi-check-filter">
-    <legend>{label}</legend>
-    <div className="multi-check-actions"><button type="button" onClick={() => onChange(options.map((option) => option.value))}>Select all</button><button type="button" onClick={() => onChange([])}>Clear</button></div>
-    <div className="multi-check-options">{options.map((option) => <label key={option.value}><input type="checkbox" checked={selectedSet.has(option.value)} onChange={() => onChange(selectedSet.has(option.value) ? selected.filter((value) => value !== option.value) : [...selected, option.value])} /><span>{option.label}</span></label>)}</div>
-  </fieldset>
+  const summary = selected.length === 1 && label === 'Year'
+    ? options.find((option) => option.value === selected[0])?.label ?? selected[0]
+    : `${selected.length} selected`
+
+  useEffect(() => {
+    if (!open) return
+    const close = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [open])
+
+  const icon = label === 'Year' || label === 'Month'
+    ? <Icon name="calendar" size={15} />
+    : label === 'Type'
+      ? <Icon name="grid" size={15} />
+      : <span className="direct-filter-cube" aria-hidden="true">◇</span>
+
+  return <div className={`direct-filter ${open ? 'open' : ''}`} ref={rootRef}>
+    <span className="direct-filter-label">{label}</span>
+    <button type="button" className="direct-filter-trigger" onClick={() => setOpen((current) => !current)} aria-haspopup="listbox" aria-expanded={open}>
+      <span className="direct-filter-summary">{icon}<strong>{summary}</strong></span><span className="direct-filter-chevron" aria-hidden="true" />
+    </button>
+    {open && <div className="direct-filter-menu">
+      <div className="direct-filter-actions"><button type="button" onClick={() => onChange(options.map((option) => option.value))}>Select all</button><button type="button" onClick={() => onChange([])}>Clear</button></div>
+      <div className="direct-filter-options" role="listbox" aria-multiselectable="true">{options.map((option) => <label key={option.value}><input type="checkbox" checked={selectedSet.has(option.value)} onChange={() => onChange(selectedSet.has(option.value) ? selected.filter((value) => value !== option.value) : [...selected, option.value])} /><span>{option.label}</span></label>)}</div>
+    </div>}
+  </div>
 }
 
 function ReportCenter() {
@@ -363,7 +397,7 @@ function ReportCenter() {
       .then((options) => {
         setDirectOptions(options)
         setDirectYears(options.years.length ? [String(options.years[0])] : [])
-        setDirectMonths(options.months.map(String))
+        setDirectMonths(months.map((_, index) => String(index + 1)))
         setDirectTypes(options.types)
         setDirectProducts(options.products)
       })
@@ -424,14 +458,14 @@ function ReportCenter() {
         <label className="report-type-field"><span>Report</span><select value={reportType} onChange={(event) => setReportType(event.target.value as ReportType)}>{Object.entries(reportNames).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
       </div>
       {isDirectOverview && directOptions && <div className="direct-overview-filters">
-        <MultiCheckFilter label="Year" options={directOptions.years.map((value) => ({ value: String(value), label: String(value) }))} selected={directYears} onChange={setDirectYears} />
-        <MultiCheckFilter label="Month" options={directOptions.months.map((value) => ({ value: String(value), label: months[value - 1] }))} selected={directMonths} onChange={setDirectMonths} />
-        <MultiCheckFilter label="Type" options={directOptions.types.map((value) => ({ value, label: value }))} selected={directTypes} onChange={setDirectTypes} />
-        <MultiCheckFilter label="Product" options={directOptions.products.map((value) => ({ value, label: value }))} selected={directProducts} onChange={setDirectProducts} />
+        <DirectOverviewFilter label="Year" options={directOptions.years.map((value) => ({ value: String(value), label: String(value) }))} selected={directYears} onChange={setDirectYears} />
+        <DirectOverviewFilter label="Month" options={months.map((label, index) => ({ value: String(index + 1), label }))} selected={directMonths} onChange={setDirectMonths} />
+        <DirectOverviewFilter label="Type" options={directOptions.types.map((value) => ({ value, label: value }))} selected={directTypes} onChange={setDirectTypes} />
+        <DirectOverviewFilter label="Product" options={directOptions.products.map((value) => ({ value, label: value }))} selected={directProducts} onChange={setDirectProducts} />
       </div>}
     </section>
     {isDirectOverview && <section className="report-preview-card report-export-card direct-overview-card">
-      <div className="report-preview-head"><div><span className="section-kicker">Styled Excel export</span><h3>Direct Sales Overview</h3><p>Provides the detailed In Office, Stall, Bulk, Call, Retail, and Language Lab classification.</p></div><span className="format-pill">XLSX</span></div>
+      <div className="report-preview-head"><div><span className="section-kicker">Styled Excel export</span><h3>Direct Sales Overview</h3><p>Provides the detailed In Office, Stall, Bulk, Call, Retail, Course Promotion, and Language Lab classification.</p></div><span className="format-pill">XLSX</span></div>
       {directError && <div className="error-message">{directError}</div>}
       {directPreview?.validated && <div className="direct-overview-validation">
         {directOptions?.types.map((type) => <div key={type}><span>{type}</span><strong>{Math.round(directPreview.totals[type] ?? 0).toLocaleString('en-IN')}</strong></div>)}
@@ -879,7 +913,10 @@ function ProductRankings({
     const productTotals = new Map<string, number>()
     filteredDetails.filter((row) => row.channel === channel).forEach((row) => productTotals.set(row.description, (productTotals.get(row.description) ?? 0) + row.total_invoice_value))
     const ranked = [...productTotals].map(([name, amount]) => ({ name, amount })).sort((a, b) => b.amount - a.amount)
-    return { channel, count: ranked.length, top: ranked.slice(0, 5), bottom: [...ranked].reverse().slice(0, 5) }
+    const top = ranked.slice(0, 5)
+    const topNames = new Set(top.map((item) => item.name))
+    const bottom = ranked.filter((item) => !topNames.has(item.name)).reverse().slice(0, 5)
+    return { channel, count: ranked.length, top, bottom }
   })
   const topProductChannels = [...filteredChannelRankings].sort((left, right) => (right.top[0]?.amount ?? 0) - (left.top[0]?.amount ?? 0))
   const TOP_PRODUCT_BAR_BASELINE = Math.max(...topProductChannels.map((channel) => channel.top[0]?.amount ?? 0), 1)
@@ -905,7 +942,6 @@ function ProductRankings({
     <div className="product-channel-sections">
       {filteredChannelRankings.map((channel) => <article className="product-channel-section" key={channel.channel}>
         <div className="product-channel-heading"><strong>{channel.channel}</strong><span className="product-range-summary"><b>Top</b><strong>{money(channel.top[0]?.amount ?? 0)}</strong><i>·</i><b>bottom</b><strong>{money(channel.bottom[0]?.amount ?? 0)}</strong></span></div>
-        {channel.top.some((top) => channel.bottom.some((bottom) => top.name === bottom.name)) && <div className="product-overlap-note">Only {channel.count} products with sales — lists overlap</div>}
         <div className="product-rankings-grid">
           <div className="product-rank-list">
             <div className="product-rank-title top"><span>↓</span><div><strong>Top 5 · highest sales</strong><small>Largest to smallest</small></div></div>
@@ -998,8 +1034,16 @@ function FinancialBreakdown({ data, loading, channel, onChannelChange, dateFilte
     { key: 'total_tax', label: 'Total tax' },
     { key: 'total_sale', label: 'Total sales' },
   ] as const
+  const downloadFinancialBreakdown = () => downloadCsv(
+    `financial-breakdown-${channel === 'all' ? 'all-channels' : channel}.csv`,
+    ['Particulars', ...channels, 'Total'],
+    rows.map((row) => {
+      const values = channels.map((channelName) => Number(data[channelName]?.[row.key] ?? 0))
+      return [row.label, ...values, values.reduce((sum, value) => sum + value, 0)]
+    }),
+  )
   return <section className={`financial-breakdown-card ${loading ? 'is-loading' : ''}`}>
-    <div className="financial-breakdown-head"><div><h3>Financial breakdown</h3><p>Financial values use the same channel rules as the Summary report.</p></div></div>
+    <div className="financial-breakdown-head"><div><h3>Financial breakdown</h3><p>Financial values use the same channel rules as the Summary report.</p></div><button className="table-download-button" type="button" disabled={loading} onClick={downloadFinancialBreakdown}>↓ Download CSV</button></div>
     <div className="financial-breakdown-filters"><label><span>Channel</span><select value={channel} onChange={(event) => onChannelChange(event.target.value)}>{DASHBOARD_CHANNEL_OPTIONS.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>{dateFilter}</div>
     <div className="financial-breakdown-wrap"><table className="financial-breakdown-table"><thead><tr><th>Particulars</th>{channels.map((channel) => <th key={channel}>{channel}</th>)}<th>Total</th></tr></thead><tbody>{rows.map((row) => {
       const total = channels.reduce((sum, channel) => sum + Number(data[channel]?.[row.key] ?? 0), 0)
@@ -1534,9 +1578,10 @@ function DashboardPage() {
     { channel: 'Bulk', currentMonthlyPlan: currentPerformancePlan('Bulk', CHANNEL_MONTHLY_PLANS.bulk), comparisonMonthlyPlan: comparisonPerformancePlan('Bulk', CHANNEL_MONTHLY_PLANS.bulk) },
     { channel: 'Call', currentMonthlyPlan: currentPerformancePlan('Call', CHANNEL_MONTHLY_PLANS.call), comparisonMonthlyPlan: comparisonPerformancePlan('Call', CHANNEL_MONTHLY_PLANS.call) },
     { channel: 'Retail', currentMonthlyPlan: currentPerformancePlan('Retail', CHANNEL_MONTHLY_PLANS.retail), comparisonMonthlyPlan: comparisonPerformancePlan('Retail', CHANNEL_MONTHLY_PLANS.retail) },
+    { channel: 'Course Promotion', currentMonthlyPlan: currentPerformancePlan('Course Promotion', CHANNEL_MONTHLY_PLANS.coursePromotion), comparisonMonthlyPlan: comparisonPerformancePlan('Course Promotion', CHANNEL_MONTHLY_PLANS.coursePromotion) },
   ]
   const reconciledChannelActuals = (period: 'current' | 'comparison', total: number) => {
-    const directNames = ['In Office', 'Stall', 'Bulk', 'Call', 'Retail']
+    const directNames = ['In Office', 'Stall', 'Bulk', 'Call', 'Retail', 'Course Promotion']
     const directRaw = directNames.map((channel) => channelActual(period, channel))
     let directActuals = reconciledWholeValues(
       directRaw,
@@ -1768,7 +1813,7 @@ function DashboardPage() {
     Amazon: data.monthly_plans?.Amazon ?? (activeYear === 2026 ? DEFAULT_2026_SALES_PLANS.Amazon : 0),
     'Direct Sales': data.monthly_plans?.['Direct Sales'] ?? (activeYear === 2026 ? DEFAULT_2026_SALES_PLANS['Direct Sales'] : 0),
   }
-  const performanceCoreMonthlyPlan = ['Digital Online', 'In Office', 'Stall', 'Bulk', 'Call', 'Retail']
+  const performanceCoreMonthlyPlan = ['Digital Online', 'In Office', 'Stall', 'Bulk', 'Call', 'Retail', 'Course Promotion']
     .reduce((sum, channel) => sum + (data.monthly_plans?.[channel] ?? 0), 0)
   const selectedPlanChannel = globalChannel === 'dsg' ? 'DSG' : globalChannel === 'sfh' ? 'SFH' : globalChannel === 'amazon' ? 'Amazon' : globalChannel === 'direct' ? 'Direct Sales' : null
   const selectedMonthlyPlan = selectedPlanChannel
@@ -2057,12 +2102,14 @@ function CategoryReview({
   onBack,
   onContinue,
   channel,
+  onDelete,
 }: {
   uploadId: string
   initialRows: ReviewRow[]
   onBack: () => void
   onContinue: () => void
   channel: UploadChannel
+  onDelete?: () => void
 }) {
   const [rows, setRows] = useState(initialRows)
   const [choices, setChoices] = useState<Record<number, string>>({})
@@ -2144,7 +2191,7 @@ function CategoryReview({
           <h2>Review {channel} categories</h2>
           <p>Known categories were mapped automatically. Resolve the records below before continuing.</p>
         </div>
-        <div className="review-count"><strong>{rows.length}</strong><span>records remaining</span></div>
+        <div className="review-header-actions"><div className="review-count"><strong>{rows.length}</strong><span>records remaining</span></div>{onDelete && <button className="delete-button discard-upload" type="button" onClick={onDelete}>Delete upload</button>}</div>
       </section>
       <section className="workflow">
         {['Upload', 'Category Review', 'Product Review', 'Save Dataset', 'Completed'].map((step, index) => (
@@ -2233,12 +2280,14 @@ function ProductReview({
   onComplete,
   onPendingGroupsChange,
   channel,
+  onDelete,
 }: {
   uploadId: string
   initialGroups: ProductGroup[]
   onComplete: () => void
   onPendingGroupsChange: (groups: ProductGroup[]) => void
   channel: UploadChannel
+  onDelete?: () => void
 }) {
   const [groups, setGroups] = useState(initialGroups)
   const [names, setNames] = useState<Record<string, Record<string, string>>>(
@@ -2328,7 +2377,7 @@ function ProductReview({
     <div className="content category-page">
       <section className="intro">
         <div><span className="section-kicker">Product standardisation</span><h2>Review similar {channel === 'SFH' ? 'course' : 'product'} names</h2><p>Confirm one standard name for every detected group. All matching records will update immediately.</p></div>
-        <div className="review-count"><strong>{groups.length}</strong><span>groups remaining</span></div>
+        <div className="review-header-actions"><div className="review-count"><strong>{groups.length}</strong><span>groups remaining</span></div>{onDelete && <button className="delete-button discard-upload" type="button" onClick={onDelete}>Delete upload</button>}</div>
       </section>
       <section className="workflow">
         {['Upload', 'Category Review', 'Product Review', 'Save Dataset', 'Completed'].map((step, index) => (
@@ -2411,7 +2460,7 @@ function UploadHistoryPage() {
   }, [])
 
   const remove = async (record: HistoryRecord) => {
-    if (!window.confirm(`Delete "${record.file_name}"?\n\nThis will also permanently delete all of its DSG rows from PostgreSQL.`)) return
+    if (!window.confirm(`Delete "${record.file_name}"?\n\nThis will permanently delete the dataset and all of its stored ${channelDisplayName(record.channel)} rows from PostgreSQL. You can then upload a replacement file.`)) return
     setDeleting(record.upload_id)
     try {
       const response = await fetch(`/api/uploads/history/${record.upload_id}`, { method: 'DELETE' })
@@ -2458,7 +2507,7 @@ type ManagedPlan = {
 
 type ManagedCategoryPlan = Omit<ManagedPlan, 'channel'> & { category: string }
 
-const PLAN_CHANNELS = ['Digital Online', 'In Office', 'Stall', 'Bulk', 'Call', 'Retail', 'Language Lab', 'OTT']
+const PLAN_CHANNELS = ['Digital Online', 'In Office', 'Stall', 'Bulk', 'Call', 'Retail', 'Course Promotion', 'Language Lab', 'OTT']
 const PLAN_CATEGORIES = ['Books', 'Web Version', 'Audio Device', 'Pen Drive']
 
 function PlanUpdationPage() {
@@ -2842,6 +2891,28 @@ function App() {
     }
   }
 
+  const discardPendingUpload = async () => {
+    if (!uploadId || !window.confirm(`Delete this unfinished ${channelDisplayName(selectedChannel)} upload?\n\nYou can upload corrected or replacement files afterwards.`)) return
+    try {
+      const path = channelPath(selectedChannel)
+      const response = await fetch(`/api/uploads/${path}/${uploadId}`, { method: 'DELETE' })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail ?? `Unable to delete the ${channelDisplayName(selectedChannel)} upload.`)
+      sessionStorage.removeItem('dsgUpload')
+      setUploadId('')
+      setReviewRows([])
+      setProductGroups([])
+      setFile(null)
+      setInventoryFile(null)
+      setDirectUnmatched(null)
+      setUploadState('idle')
+      setWorkflowPage('upload')
+      setError('')
+    } catch (reason) {
+      window.alert(reason instanceof Error ? reason.message : `Unable to delete the ${channelDisplayName(selectedChannel)} upload.`)
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -2871,9 +2942,9 @@ function App() {
         </header>
 
         {activeModule === 'dashboard' ? <DashboardPage /> : activeModule === 'reports' ? <ReportCenter /> : activeModule === 'plans' ? <PlanUpdationPage /> : activeModule === 'history' ? <UploadHistoryPage /> : activeModule !== 'upload' ? <Placeholder title={activeLabel} /> : workflowPage === 'category' ? (
-          <CategoryReview uploadId={uploadId} initialRows={reviewRows} channel={selectedChannel} onBack={() => setWorkflowPage('upload')} onContinue={continueAfterCategory} />
+          <CategoryReview uploadId={uploadId} initialRows={reviewRows} channel={selectedChannel} onBack={() => setWorkflowPage('upload')} onContinue={continueAfterCategory} onDelete={selectedChannel === 'Direct Sales' ? () => { void discardPendingUpload() } : undefined} />
         ) : workflowPage === 'product' ? (
-          <ProductReview uploadId={uploadId} initialGroups={productGroups} channel={selectedChannel} onPendingGroupsChange={setProductGroups} onComplete={() => { void completeAndShowHistory(uploadId, null, true) }} />
+          <ProductReview uploadId={uploadId} initialGroups={productGroups} channel={selectedChannel} onPendingGroupsChange={setProductGroups} onComplete={() => { void completeAndShowHistory(uploadId, null, true) }} onDelete={selectedChannel === 'Amazon' || selectedChannel === 'Direct Sales' ? () => { void discardPendingUpload() } : undefined} />
         ) : workflowPage === 'saving' ? (
           <SavingDataset channel={selectedChannel} />
         ) : (

@@ -13,6 +13,7 @@ from sqlalchemy import func
 
 from app.database.database import SessionLocal
 from app.database.models import AmazonDatasetRow, DirectSalesDatasetRow, DSGDatasetRow, SFHDatasetRow, UploadHistory
+from app.direct_sales_classification import DIRECT_SALES_CLASSIFICATIONS, classify_direct_sale
 from app.calculations.amounts import sfh_amount_from_record, sfh_is_inr_currency
 from app.plans import category_plans_for_year, plan_data_version, plans_for_year, saved_plan_years
 
@@ -213,26 +214,15 @@ def _direct_sales_channel(
     invoice_is_bulk: bool | None = None,
 ) -> str:
     """Return the detailed Direct Sales mapping used by Channel Performance."""
-    private_notes = str(_row_value(row.row_data, ("private notes",)) or "").casefold()
-    if "language lab" in private_notes:
-        return "Language Lab"
-    # Re-evaluate from the persisted invoice notes and invoice-level mapped
-    # quantity so older uploads receive the current mutually exclusive mapping.
-    if "stall" in private_notes:
-        return "Stall"
-    if "vedanta" in private_notes:
-        return "Retail"
-    if invoice_is_bulk is True or (
-        invoice_is_bulk is None
-        and _number(_row_value(
-            row.row_data,
-            ("bulk classification quantity", "category quantity", "mapped quantity"),
-        )) > 10
-    ):
-        return "Bulk"
-    if any(term in private_notes for term in ("phone", "ph no", "call")):
-        return "Call"
-    return "In Office"
+    return classify_direct_sale(
+        (
+            _row_value(row.row_data, ("private notes",)),
+            row.product_name,
+            row.category,
+            _row_value(row.row_data, ("item details", "product name", "description")),
+        ),
+        _row_value(row.row_data, ("category quantity", "bulk classification quantity")),
+    )
     try:
         return float(str(value).replace(",", "").replace("₹", "").strip())
     except (TypeError, ValueError):
@@ -713,10 +703,7 @@ def _direct_sales_classification(
             row_year == selected_year and row_month <= cutoff
         )
 
-    totals = {
-        "In Office": 0.0, "Stall": 0.0, "Bulk": 0.0,
-        "Call": 0.0, "Retail": 0.0, "Language Lab": 0.0,
-    }
+    totals = {classification: 0.0 for classification in DIRECT_SALES_CLASSIFICATIONS}
     with nullcontext():
         upload_dates = _cached_upload_dates()
         direct_rows = list(_cached_rows(DirectSalesDatasetRow))
@@ -731,7 +718,7 @@ def _direct_sales_classification(
             )
             totals[classification] += _direct_amount(row)
     totals["Total Direct Sales"] = sum(
-        totals[channel] for channel in ("In Office", "Stall", "Bulk", "Call", "Retail")
+        totals[channel] for channel in ("In Office", "Stall", "Bulk", "Call", "Retail", "Course Promotion")
     )
     return {key: _rounded(value) for key, value in totals.items()}
 
@@ -1452,6 +1439,7 @@ def _build_dashboard_kpis(
         "Call": 0.0,
         "Retail": 0.0,
         "Language Lab": 0.0,
+        "Course Promotion": 0.0,
         "Total Direct Sales": 0.0,
     }
     direct_sales_performance = ({
@@ -1499,6 +1487,7 @@ def _build_dashboard_kpis(
             "Call": direct_values["Call"],
             "Retail": direct_values["Retail"],
             "Language Lab": direct_values["Language Lab"],
+            "Course Promotion": direct_values["Course Promotion"],
             "OTT": 0.0,
         }
         values["Total Sales"] = _rounded(
@@ -1508,6 +1497,7 @@ def _build_dashboard_kpis(
             + values["Bulk"]
             + values["Call"]
             + values["Retail"]
+            + values["Course Promotion"]
         )
         values["Grand Total Sales"] = _rounded(
             values["Total Sales"] + values["Language Lab"] + values["OTT"]

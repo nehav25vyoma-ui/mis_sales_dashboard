@@ -12,6 +12,7 @@ from app.reports import (
     _append_amazon_summary_sheet,
     _append_direct_sales_summary_sheet,
     _build_direct_sales_overview,
+    _direct_overview_type,
     _channel_performance_workbook,
     _product_performance_workbook,
     _product_type,
@@ -62,6 +63,27 @@ def test_product_report_grand_total_updates_with_excel_filters():
     assert sheet.cell(3, 8).value == "=SUBTOTAL(109,H2:H2)"
     assert sheet.cell(2, 8).number_format == INDIAN_LAKH_FORMAT
     assert sheet.cell(3, 8).number_format == INDIAN_WHOLE_NUMBER_FORMAT
+
+
+def test_product_report_counts_unique_amazon_order_ids():
+    def amazon_row(order_id: str):
+        return SimpleNamespace(
+            product_name="Book A",
+            course=None,
+            category="Books",
+            amount="100",
+            row_data={"amazon-order-id": order_id, "quantity": 1},
+        )
+
+    workbook = _product_performance_workbook([
+        ("Amazon", amazon_row("AMZ-1"), "2026-08"),
+        ("Amazon", amazon_row("AMZ-1"), "2026-08"),
+        ("Amazon", amazon_row("AMZ-2"), "2026-08"),
+    ])
+    sheet = workbook["Amazon"]
+
+    assert sheet.cell(2, 6).value == 2
+    assert sheet.cell(3, 6).value == "=SUBTOTAL(109,F2:F2)"
 
 
 def test_summary_displayed_pnl_equals_displayed_sales_buckets(monkeypatch):
@@ -516,7 +538,7 @@ def test_direct_sales_overview_reuses_dashboard_mapping_and_reconciles():
         [
             _direct_row(1, "A", "Bulk Book", 100.4, 11),
             _direct_row(2, "B", "Retail Book", 50.4, 2),
-            _direct_row(3, "C", "Stall Book", 25.4, 20, "Stall counter"),
+            _direct_row(3, "C", "Stall Book", 25.4, 1, "Stall counter"),
         ],
         [SimpleNamespace(upload_id="upload-1", uploaded_at=None)],
     )
@@ -531,7 +553,7 @@ def test_direct_sales_overview_reuses_dashboard_mapping_and_reconciles():
     assert result["validated"] is True
     assert result["totals"] == {
         "In Office": 50, "Stall": 25, "Bulk": 101,
-        "Call": 0, "Retail": 0, "Language Lab": 0,
+        "Call": 0, "Retail": 0, "Language Lab": 0, "Course Promotion": 0,
     }
     assert result["overall_total"] == 176
     assert {row["type"] for row in result["rows"]} == {"Bulk", "In Office", "Stall"}
@@ -573,12 +595,40 @@ def test_direct_sales_overview_separates_language_lab_from_retail():
     assert result["overall_total"] == 48814
 
 
+def test_direct_sales_overview_includes_course_promotion_in_priority_order():
+    database = _OverviewDatabase(
+        [
+            _direct_row(1, "I-1", "Office Book", 100, 1),
+            _direct_row(2, "C-1", "S101 Course", 250, 1, "course promotion"),
+            _direct_row(3, "S-1", "Stall Book", 300, 1, "stall"),
+        ],
+        [SimpleNamespace(upload_id="upload-1", uploaded_at=None)],
+    )
+
+    result = _build_direct_sales_overview(
+        database,
+        years={2026}, months={4},
+        types={"Stall", "Course Promotion", "In Office"}, products=set(),
+    )
+
+    assert [row["type"] for row in result["rows"]] == [
+        "Stall", "Course Promotion", "In Office",
+    ]
+    assert result["totals"]["Course Promotion"] == 250
+    assert result["overall_total"] == 650
+    assert result["detail_rows"] == [
+        {"year": 2026, "month": "Apr", "invoice": "s-1", "type": "Stall", "product": "Stall Book", "quantity": 1.0, "without_tax_total": 300.0},
+        {"year": 2026, "month": "Apr", "invoice": "c-1", "type": "Course Promotion", "product": "S101 Course", "quantity": 1.0, "without_tax_total": 250.0},
+        {"year": 2026, "month": "Apr", "invoice": "i-1", "type": "In Office", "product": "Office Book", "quantity": 1.0, "without_tax_total": 100.0},
+    ]
+
+
 def test_direct_sales_overview_exposes_call_retail_and_in_office_separately():
     database = _OverviewDatabase(
         [
             _direct_row(1, "I-1", "Office Book", 100, 1),
             _direct_row(2, "C-1", "Call Book", 200, 1, "phone call"),
-            _direct_row(3, "R-1", "Retail Book", 300, 1, "Vedanta"),
+            _direct_row(3, "R-1", "Retail Book", 300, 1, "vendant"),
         ],
         [SimpleNamespace(upload_id="upload-1", uploaded_at=None)],
     )
@@ -591,16 +641,23 @@ def test_direct_sales_overview_exposes_call_retail_and_in_office_separately():
 
     assert result["totals"] == {
         "In Office": 100, "Stall": 0, "Bulk": 0,
-        "Call": 200, "Retail": 300, "Language Lab": 0,
+        "Call": 200, "Retail": 300, "Language Lab": 0, "Course Promotion": 0,
     }
 
 
 def test_channel_performance_keeps_call_and_retail_separate():
     assert _direct_sales_channel(_direct_row(1, "C-1", "Call", 100, 1, "phone call")) == "Call"
-    assert _direct_sales_channel(_direct_row(2, "R-1", "Retail", 100, 1, "Vedanta")) == "Retail"
-    assert _direct_sales_channel(_direct_row(5, "R-2", "Retail Bulk Qty", 100, 25, "Vedanta")) == "Retail"
+    assert _direct_sales_channel(_direct_row(2, "R-1", "Retail", 100, 1, "vendant")) == "Retail"
+    assert _direct_sales_channel(_direct_row(5, "R-2", "Retail Bulk Qty", 100, 25, "vendant")) == "Retail"
     assert _direct_sales_channel(_direct_row(3, "S-1", "Stall", 100, 1, "stall")) == "Stall"
     assert _direct_sales_channel(_direct_row(4, "B-1", "Bulk", 100, 11)) == "Bulk"
+
+
+def test_direct_sales_overview_quantity_over_ten_is_always_bulk():
+    row = _direct_row(1, "B-1", "Course Book", 100, 11, "stall course call vendant")
+
+    assert _direct_overview_type(row) == "Bulk"
+    assert _direct_sales_channel(row) == "Stall"
 
 
 def test_direct_sales_overview_rejects_duplicate_source_rows():
