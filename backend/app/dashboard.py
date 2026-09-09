@@ -222,6 +222,8 @@ def _direct_sales_channel(
             _row_value(row.row_data, ("item details", "product name", "description")),
         ),
         _row_value(row.row_data, ("category quantity", "bulk classification quantity")),
+        customer_name=_row_value(row.row_data, ("client name",)),
+        private_notes=_row_value(row.row_data, ("private notes",)),
     )
     try:
         return float(str(value).replace(",", "").replace("₹", "").strip())
@@ -737,6 +739,20 @@ def _language_lab_monthly() -> dict[str, float]:
     return totals
 
 
+def _language_lab_category_metrics() -> dict[str, Any]:
+    """Additional KPI sales only; leave tax and channel classifications unchanged."""
+    metrics = _empty_metrics()
+    upload_dates = _cached_upload_dates()
+    for row in _cached_rows(DirectSalesDatasetRow):
+        if row.category != "Language Lab":
+            continue
+        month = _month(row.row_data, upload_dates.get(row.upload_id, datetime.now()))
+        amount = _direct_amount(row)
+        metrics["pnl"] += amount
+        metrics["monthly"][month]["pnl"] += amount
+    return metrics
+
+
 def _period_pnl(
     metrics: dict[str, Any],
     grain: str,
@@ -777,6 +793,20 @@ def _period_pnl(
     return _rounded(total)
 
 
+def _performance_month_matches(month_key: str, grain: str, period: str, selected_year: int) -> bool:
+    row_year, row_month = (int(value) for value in month_key.split("-"))
+    if grain == "monthly":
+        return row_year == selected_year and row_month in {int(value) for value in period.split(",")}
+    if grain == "quarterly":
+        return row_year == selected_year and (row_month - 1) // 3 + 1 == int(period)
+    cutoff = datetime.now().month
+    if cutoff >= 4:
+        return row_year == selected_year and 4 <= row_month <= cutoff
+    return (row_year == selected_year - 1 and row_month >= 4) or (
+        row_year == selected_year and row_month <= cutoff
+    )
+
+
 def _product_rankings(
     channel: str,
     grain: str,
@@ -791,22 +821,7 @@ def _product_rankings(
     )
 
     def included(month_key: str) -> bool:
-        row_year, row_month = (int(value) for value in month_key.split("-"))
-        if grain == "monthly":
-            return row_year == selected_year and row_month in selected_months
-        if grain == "quarterly":
-            first_month = (int(period) - 1) * 3 + 1
-            return row_year == selected_year and row_month in {
-                first_month, first_month + 1, first_month + 2
-            }
-        cutoff = current.month
-        if cutoff >= 4:
-            return row_year == selected_year and 4 <= row_month <= cutoff
-        return (
-            row_year == selected_year - 1 and row_month >= 4
-        ) or (
-            row_year == selected_year and row_month <= cutoff
-        )
+        return _performance_month_matches(month_key, grain, period, selected_year)
 
     totals: dict[str, dict[str, float]] = {
         "dsg": defaultdict(float),
@@ -1513,10 +1528,20 @@ def _build_dashboard_kpis(
         ),
     }
 
+    lab_metrics = _language_lab_category_metrics() if channel in {"all", "direct"} else _empty_metrics()
+    selected_lab = _for_period(lab_metrics, grain, period, year)
+    previous_lab, previous_lab_has_data = _for_exact_months(lab_metrics, previous_year, previous_months)
+    pnl_card_metrics = _empty_metrics()
+    for source in (selected, selected_lab):
+        for month, values in source["monthly"].items():
+            _merge_month(pnl_card_metrics, month, values)
+
     def breakdown(metric: str) -> list[dict[str, object]]:
         if channel == "all":
             return [
-                {"label": labels[key], "value": _rounded(metrics[metric])}
+                {"label": labels[key], "value": _rounded(
+                    metrics[metric] + (selected_lab["pnl"] if metric == "pnl" and key == "direct" else 0.0)
+                )}
                 for key, metrics in period_metrics.items()
             ]
         if metric == "pnl":
@@ -1542,10 +1567,13 @@ def _build_dashboard_kpis(
                         "without a complete product-category mapping."
                     ),
                 )
-            return [
+            result = [
                 {"label": label, "value": _rounded(category_values[category])}
                 for category, label in category_labels
             ]
+            if channel == "direct":
+                result.append({"label": "Language Lab", "value": _rounded(selected_lab["pnl"])})
+            return result
         if metric == "zero_rated":
             return [
                 {"label": category, "value": _rounded(selected["zero_categories"][category])}
@@ -1647,10 +1675,10 @@ def _build_dashboard_kpis(
             {
                 "id": metric,
                 "title": title,
-                "subtitle": subtitle,
+                "subtitle": subtitle + (" + Language Lab" if metric == "pnl" and channel in {"all", "direct"} else ""),
                 "total": (
                     current_order_total
-                    if metric == "orders" else _rounded(selected[metric])
+                    if metric == "orders" else _rounded(selected[metric] + (selected_lab["pnl"] if metric == "pnl" else 0.0))
                 ),
                 "breakdown": (
                     [
@@ -1659,12 +1687,12 @@ def _build_dashboard_kpis(
                     ]
                     if metric == "orders" else breakdown(metric)
                 ),
-                "trend": [] if metric == "orders" else _trend(selected, metric, grain),
+                "trend": [] if metric == "orders" else _trend(pnl_card_metrics if metric == "pnl" else selected, metric, grain),
                 **(
                     {
-                        "previous_total": _rounded(previous_metrics[metric]),
+                        "previous_total": _rounded(previous_metrics[metric] + (previous_lab["pnl"] if metric == "pnl" else 0.0)),
                         "previous_period_label": previous_label,
-                        "previous_has_data": previous_has_data,
+                        "previous_has_data": previous_has_data or (metric == "pnl" and previous_lab_has_data),
                     }
                     if metric in {"zero_rated", "exempted", "taxable", "pnl"} else (
                         {

@@ -2,6 +2,7 @@ from collections import defaultdict
 import csv
 from datetime import datetime
 from io import BytesIO, StringIO
+from math import floor
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query
@@ -14,6 +15,12 @@ from app.calculations.amounts import sfh_amount_from_record, sfh_is_inr_currency
 from app.dashboard import (
     _direct_bulk_invoice_ids,
     _direct_amount,
+    _direct_sales_channel,
+    _add_row,
+    _empty_metrics,
+    dashboard_kpis,
+    _performance_month_matches,
+    _dashboard_source_snapshot,
     _dsg_basic_amount,
     _amazon_is_excluded,
     _dsg_is_completed,
@@ -26,7 +33,7 @@ from app.dashboard import (
 )
 from app.database.database import SessionLocal
 from app.database.models import AmazonDatasetRow, DirectSalesDatasetRow, DSGDatasetRow, SFHDatasetRow, UploadHistory
-from app.direct_sales_classification import DIRECT_SALES_CLASSIFICATIONS, classify_direct_sale
+from app.direct_sales_classification import DIRECT_SALES_CLASSIFICATIONS
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
@@ -74,21 +81,7 @@ def _direct_overview_type(
     invoice_is_bulk: bool | None = None,
 ) -> str:
     """Return the Direct Sales Overview mapping for one product record."""
-    product_quantity = _row_value(
-        row.row_data,
-        ("category quantity", "bulk classification quantity"),
-    )
-    if _number(product_quantity) > 10:
-        return "Bulk"
-    return classify_direct_sale(
-        (
-            _row_value(row.row_data, ("private notes",)),
-            row.product_name,
-            row.category,
-            _row_value(row.row_data, ("item details", "product name", "description")),
-        ),
-        product_quantity,
-    )
+    return _direct_sales_channel(row, invoice_is_bulk)
 
 
 def _channel_display_name(channel: str) -> str:
@@ -139,7 +132,7 @@ def _period_label(grain: str, period: str, year: int) -> str:
     return str(year)
 
 
-def _filtered_rows(database, grain: str, period: str, year: int):
+def _filtered_rows(database, grain: str, period: str, year: int, *, performance: bool = False):
     upload_dates = {row.upload_id: row.uploaded_at for row in database.query(UploadHistory).all()}
     fallback = datetime.now()
     result = []
@@ -150,7 +143,8 @@ def _filtered_rows(database, grain: str, period: str, year: int):
             if channel == "Amazon" and _amazon_is_excluded(row):
                 continue
             month_key = _month(row.row_data, upload_dates.get(row.upload_id, fallback))
-            if _matches(month_key, grain, period, year):
+            matches = _performance_month_matches if performance else _matches
+            if matches(month_key, grain, period, year):
                 result.append((channel, row, month_key))
     return result
 
@@ -290,14 +284,11 @@ def _build_direct_sales_overview(
     ]
     reconciled_type_totals = dict(zip(
         type_order,
-        _reconciled_whole_numbers(raw_type_totals),
+        [_visual_whole(value) for value in raw_type_totals],
     ))
     for type_name, indexes in indexes_by_type.items():
         quantities = _reconciled_whole_numbers([ordered[index][1]["quantity"] for index in indexes])
-        amounts = _reconciled_whole_numbers(
-            [ordered[index][1]["amount"] for index in indexes],
-            target=reconciled_type_totals[type_name],
-        )
+        amounts = [ordered[index][1]["amount"] for index in indexes]
         for position, index in enumerate(indexes):
             display_quantities[index] = quantities[position]
             display_amounts[index] = amounts[position]
@@ -318,7 +309,7 @@ def _build_direct_sales_overview(
     if len(keys) != len(rows):
         raise HTTPException(status_code=500, detail="Duplicate rows detected in Direct Sales Overview.")
     totals = {
-        type_name: sum(row["without_tax_total"] for row in rows if row["type"] == type_name)
+        type_name: _visual_whole(sum(row["without_tax_total"] for row in rows if row["type"] == type_name))
         for type_name in DIRECT_OVERVIEW_TYPE_ORDER
     }
     expected = {type_name: reconciled_type_totals[type_name] for type_name in type_order}
@@ -348,7 +339,7 @@ def _build_direct_sales_overview(
         "row_count": len(rows),
         "source_records": len(filtered),
         "totals": totals,
-        "overall_total": sum(totals.values()),
+        "overall_total": _visual_whole(sum(item["amount"] for item in filtered)),
         "validated": True,
     }
 
@@ -474,6 +465,39 @@ def _reconciled_whole_numbers(values: list[float], target: int | None = None) ->
     for offset in range(abs(difference)):
         displayed[order[offset % len(order)]] += direction
     return displayed
+
+
+def _visual_whole(value: float) -> int:
+    """Match the dashboard's two-decimal API value followed by Math.round."""
+    return floor(round(value, 2) + 0.5)
+
+
+def _visual_breakdown(values: list[float], labels: list[str]) -> list[int]:
+    displayed = [_visual_whole(value) for value in values]
+    if displayed:
+        visual_order = {"DSG": 0, "SFH": 1, "Amazon Sales": 2, "Direct Sales": 3}
+        largest = max(range(len(displayed)), key=lambda index: (
+            abs(displayed[index]), -visual_order[labels[index]],
+        ))
+        displayed[largest] += _visual_whole(sum(values)) - sum(displayed)
+    return displayed
+
+
+def _category_visual_values(channel: str, grain: str, period: str, year: int) -> dict[str, int]:
+    data = dashboard_kpis(channel=channel, grain=grain, period=period, year=year,
+                         comparison_grain=grain, comparison_period=period, comparison_year=year)
+    rows = data["category_performance"]
+    values = [row["current"]["actual"] for row in rows]
+    displayed = [floor(value + 0.5) for value in values]
+    difference = _visual_whole(data["channel_wise_performance"]["current"]["Total Sales"]) - sum(displayed)
+    if difference and values:
+        errors = [value - rounded for value, rounded in zip(values, displayed)]
+        order = sorted(range(len(values)), key=lambda index: errors[index], reverse=difference > 0)
+        direction = 1 if difference > 0 else -1
+        quotient, remainder = divmod(abs(difference), len(order))
+        for position, index in enumerate(order):
+            displayed[index] += direction * (quotient + (position < remainder))
+    return {row["category"]: value for row, value in zip(rows, displayed)}
 
 
 def _report_year_month(month_key: str) -> tuple[int | str, str]:
@@ -632,8 +656,7 @@ def _append_sfh_summary_sheet(workbook: Workbook, rows, label: str) -> None:
             _row_value(data, ("invoice no.", "invoice no", "invoice number")) or ""
         ).strip()
         invoice_key = invoice.casefold()
-        if invoice_key in seen_invoices:
-            continue
+        first_invoice_row = invoice_key not in seen_invoices
         seen_invoices.add(invoice_key)
         currency = _row_value(data, ("currency",))
         # SFH business rule: only the rupee symbol is INR. Text such as
@@ -643,7 +666,7 @@ def _append_sfh_summary_sheet(workbook: Workbook, rows, label: str) -> None:
             data,
             ("without tax total",) if is_inr else ("earnings",),
         ))
-        total_tax = _number(_row_value(data, ("tax",))) if is_inr else 0.0
+        total_tax = _number(_row_value(data, ("tax",))) if is_inr and first_invoice_row else 0.0
         taxable_value = _summary_taxable_value(basic_value, 0, 0)
         output_rows.append([
             len(output_rows) + 1,
@@ -827,23 +850,16 @@ def _summary_gst(channel: str, rows) -> float:
 
 
 def _direct_summary_values(rows) -> dict[str, float]:
-    """Build Direct summary buckets from the same rows shown on its detail sheet."""
-    values: defaultdict[str, float] = defaultdict(float)
+    """Use the dashboard's domestic buckets and separate Language Lab addition."""
+    values = _empty_metrics()
     for _, row, _ in rows:
         amount = _direct_amount(row)
         if amount == 0:
             continue
-        category = str(
-            row.category or _row_value(row.row_data, ("category",)) or ""
-        ).strip()
-        if category == "Books":
-            values["exempted"] += amount
-        else:
-            # Direct Sales are domestic. Every non-book amount displayed as a
-            # Taxable Value on the detail sheet belongs in the taxable bucket,
-            # including reviewed N/A rows.
-            values["taxable"] += amount
-        values["pnl"] += amount
+        category = row.category or ""
+        _add_row(values, category=category, amount=amount, is_foreign=False, month="summary")
+        if category == "Language Lab":
+            values["pnl"] += amount
     return values
 
 
@@ -893,20 +909,20 @@ def _summary_workbook(rows, grain: str, period: str, year: int) -> Workbook:
             _summary_gst(channel_name, channel_rows),
         ]
         raw_rows.append((len(raw_rows) + 1, display_name, amounts))
-    # Reconcile each visible sales bucket, but round P&L from the combined raw
-    # channel amount. This matches the detail-sheet grand total when fractional
-    # values across multiple buckets combine to an additional rupee.
+    # Match KPI card rounding: reconcile the channel breakdown to each card's
+    # rounded aggregate, assigning any remainder to its largest channel.
     reconciled_buckets = [
-        _reconciled_whole_numbers([amounts[column] for _, _, amounts in raw_rows])
+        _visual_breakdown([amounts[column] for _, _, amounts in raw_rows], [label for _, label, _ in raw_rows])
         for column in range(1, 4)
     ]
+    displayed_sales = _visual_breakdown([amounts[4] for _, _, amounts in raw_rows], [label for _, label, _ in raw_rows])
     displayed_rows = [
         [
             raw_rows[row][2][0],
             *(reconciled_buckets[column][row] for column in range(3)),
-            whole_number(raw_rows[row][2][4]),
+            displayed_sales[row],
             whole_number(raw_rows[row][2][5]),
-            whole_number(raw_rows[row][2][4]) + whole_number(raw_rows[row][2][5]),
+            displayed_sales[row] + whole_number(raw_rows[row][2][5]),
             "",
         ]
         for row in range(len(raw_rows))
@@ -995,8 +1011,11 @@ def _product_performance_workbook(rows) -> Workbook:
         lambda: {"order_ids": set(), "types": set(), "quantity": 0.0, "total": 0.0}
     )
     for channel, row, month_key in rows:
-        product = str(row.product_name or getattr(row, "course", None) or "Unmapped").strip()
-        key = (month_key, channel, product)
+        product = str(((getattr(row, "course", None) or row.product_name) if channel == "SFH" else row.product_name) or "").strip()
+        if not product:
+            continue
+        key = (month_key, channel, product.casefold())
+        grouped[key].setdefault("product", product)
         grouped[key]["types"].add(_product_type(channel, row))
         order_id = _order_identifier(channel, row)
         if order_id:
@@ -1026,9 +1045,7 @@ def _product_performance_workbook(rows) -> Workbook:
             reconciled_quantities = _reconciled_whole_numbers(
                 [ordered[index][1]["quantity"] for index in indexes]
             )
-            reconciled_totals = _reconciled_whole_numbers(
-                [ordered[index][1]["total"] for index in indexes]
-            )
+            reconciled_totals = [ordered[index][1]["total"] for index in indexes]
             for position, index in enumerate(indexes):
                 display_quantities[index] = reconciled_quantities[position]
                 display_totals[index] = reconciled_totals[position]
@@ -1041,7 +1058,7 @@ def _product_performance_workbook(rows) -> Workbook:
                 datetime(row_year, row_month, 1).strftime("%b"),
                 channel,
                 ", ".join(sorted(values["types"], key=str.casefold)),
-                product,
+                values["product"],
                 len(values["order_ids"]),
                 quantity,
                 total,
@@ -1083,43 +1100,29 @@ def _category_performance_workbook(rows, grain: str, period: str, year: int) -> 
         month_numbers = sorted({int(value) for value in period.split(",")})
     else:
         month_numbers = sorted({int(month_key.split("-")[1]) for _, _, month_key in rows})
-    month_keys = [f"{year}-{month:02d}" for month in month_numbers]
-    month_labels = [datetime(year, month, 1).strftime("%b") for month in month_numbers]
-    canonical = {
-        "audio device": "Audio Device",
-        "books": "Books",
-        "book": "Books",
-        "pen drive": "Pen Drive",
-        "pen drives": "Pen Drive",
-        "web version": "Web Version",
-        "web / e-books": "Web Version",
-        "web version / e-books": "Web Version",
-    }
+    month_keys = ([f"{year}-{month:02d}" for month in month_numbers] if grain == "monthly"
+                  else sorted({month_key for _, _, month_key in rows}))
+    month_labels = [datetime.strptime(key, "%Y-%m").strftime("%b") for key in month_keys]
+    visual_labels = {"Audio Device": "Audio Device", "Books": "Books",
+                     "Pen Drive": "Pen Drives", "Web Version": "Web / E-Books"}
+    channel_ids = {"DSG": "dsg", "SFH": "sfh", "Amazon": "amazon", "Direct Sales": "direct"}
     preferred_order = ["Audio Device", "Books", "Pen Drive", "Web Version"]
     for channel, _ in CHANNELS:
         sheet = workbook.create_sheet(channel)
         sheet.append(["Category", *month_labels, "Total Sales", "% Contribution"])
-        monthly_totals = defaultdict(lambda: defaultdict(float))
-        for row_channel, row, month_key in rows:
-            if row_channel != channel:
-                continue
-            raw_category = str(row.category or "Uncategorised").strip()
-            category = canonical.get(raw_category.casefold(), raw_category or "Uncategorised")
-            monthly_totals[category][month_key] += _amount(channel, row)
-        categories = [category for category in preferred_order if category in monthly_totals]
-        categories.extend(sorted(
-            (category for category in monthly_totals if category not in preferred_order),
-            key=str.casefold,
-        ))
+        categories = preferred_order if any(item[0] == channel for item in rows) else []
+        period_values = (_category_visual_values(channel_ids[channel], grain, period, year)
+                         if categories else {})
         displayed_by_category = {category: [0] * len(month_keys) for category in categories}
         for month_index, month_key in enumerate(month_keys):
-            reconciled = _reconciled_whole_numbers(
-                [monthly_totals[category][month_key] for category in categories]
-            )
-            for category_index, category in enumerate(categories):
-                displayed_by_category[category][month_index] = reconciled[category_index]
+            if not categories:
+                continue
+            month_year, month_number = map(int, month_key.split("-"))
+            values = _category_visual_values(channel_ids[channel], "monthly", str(month_number), month_year)
+            for category in categories:
+                displayed_by_category[category][month_index] = values.get(visual_labels[category], 0)
         category_values = [
-            (category, values, sum(values))
+            (category, values, period_values.get(visual_labels[category], 0))
             for category, values in displayed_by_category.items()
         ]
         grand_total = sum(total for _, _, total in category_values)
@@ -1177,7 +1180,19 @@ def _channel_performance_workbook(rows) -> Workbook:
                 monthly[month_key]["with_tax_by_order"][order_id].add(
                     _with_tax_amount(channel, row)
                 )
-            monthly[month_key]["without_tax"] += _amount(channel, row)
+            if channel == "Direct Sales":
+                sales = _direct_amount(row) if _direct_sales_channel(row) != "Language Lab" else 0.0
+            else:
+                metrics = _empty_metrics()
+                category = "Books" if channel == "Amazon" else row.category or ("Web Version" if channel == "SFH" else "")
+                foreign = (
+                    str(_row_value(row.row_data, ("country code (billing)",)) or "").strip().upper() != "IN"
+                    if channel == "DSG" else not sfh_is_inr_currency(_row_value(row.row_data, ("currency",)))
+                    if channel == "SFH" else str(getattr(row, "currency", "") or "").strip().upper() != "INR"
+                )
+                _add_row(metrics, category=category, amount=_amount(channel, row), is_foreign=foreign, month=month_key)
+                sales = metrics["pnl"]
+            monthly[month_key]["without_tax"] += sales
         previous = None
         for month_key in sorted(monthly):
             values = monthly[month_key]
@@ -1188,7 +1203,7 @@ def _channel_performance_workbook(rows) -> Workbook:
                 if channel == "Amazon"
                 else sum(sum(order_values) for order_values in values["with_tax_by_order"].values())
             )
-            without_tax = whole_number(values["without_tax"])
+            without_tax = _visual_whole(values["without_tax"])
             if previous is None:
                 order_variance = order_percent = sales_variance = sales_percent = "-"
             else:
@@ -1429,8 +1444,11 @@ def download_report(
                 raise ValueError
     except ValueError as error:
         raise HTTPException(status_code=422, detail="Invalid reporting period.") from error
+    if dataset == "report" and report_type in {"summary", "category"}:
+        _dashboard_source_snapshot()
     with SessionLocal() as database:
-        rows = _filtered_rows(database, grain, period, year)
+        rows = _filtered_rows(database, grain, period, year,
+                              performance=dataset == "report" and report_type in {"category", "product"})
     workbook = _clean_workbook(rows, grain, period, year) if dataset == "clean" else (
         _summary_workbook(rows, grain, period, year)
         if report_type == "summary"

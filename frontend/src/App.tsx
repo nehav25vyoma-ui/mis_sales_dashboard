@@ -2224,7 +2224,7 @@ function CategoryReview({
                         <td>{row.order_number ?? '—'}</td><td className="product-cell">{row.product_name ?? '—'}</td>
                         <td><span className="category-tag">{row.original_category}</span></td><td>₹{amount(row.amount)}</td>
                         <td><select value={choices[row.row_id] ?? ''} onChange={(event) => setChoices({ ...choices, [row.row_id]: event.target.value })}>
-                          <option value="">Select category</option><option>Books</option><option>Web Version</option><option>Audio Device</option><option>Pen Drive</option>{channel === 'Direct Sales' && <option>N/A</option>}
+                          <option value="">Select category</option><option>Books</option><option>Web Version</option><option>Audio Device</option><option>Pen Drive</option>{channel === 'Direct Sales' && <><option>N/A</option><option>Language Lab</option></>}
                         </select></td>
                         <td><button className="table-action" disabled={busyRow === row.row_id} onClick={() => updateCategory(row)}>{busyRow === row.row_id ? 'Updating…' : 'Update'}</button></td>
                       </tr>
