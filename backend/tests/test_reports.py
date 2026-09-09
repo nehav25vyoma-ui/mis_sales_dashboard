@@ -113,7 +113,7 @@ def test_summary_displayed_pnl_equals_displayed_sales_buckets(monkeypatch):
     ]
 
 
-def test_summary_direct_sales_matches_detail_rows_and_includes_na(monkeypatch):
+def test_summary_direct_sales_matches_dashboard_exclusion_of_na(monkeypatch):
     monkeypatch.setattr("app.reports._load_channel_metrics", lambda: {
         "direct": {
             "zero_rated": 0.0, "exempted": 9999.0,
@@ -138,8 +138,8 @@ def test_summary_direct_sales_matches_detail_rows_and_includes_na(monkeypatch):
     detail = workbook["Direct Sales"]
 
     assert summary.cell(3, 5).value == 100
-    assert summary.cell(3, 6).value == 50
-    assert summary.cell(3, 7).value == 151
+    assert summary.cell(3, 6).value == 0
+    assert summary.cell(3, 7).value == 100
     assert sum(detail.cell(row, 8).value for row in (3, 4)) == pytest.approx(150.8)
 
 
@@ -309,7 +309,7 @@ def _sfh_summary_row(invoice, currency, course, without_tax, earnings, tax):
     )
 
 
-def test_sfh_summary_deduplicates_invoice_and_applies_currency_rules():
+def test_sfh_summary_keeps_dashboard_sales_rows_and_deduplicates_tax():
     rows = [
         ("SFH", _sfh_summary_row("INV-1", "₹", "Course A", 100, 150, 18), "2026-08"),
         ("SFH", _sfh_summary_row("INV-1", "₹", "Duplicate", 100, 150, 18), "2026-08"),
@@ -321,15 +321,17 @@ def test_sfh_summary_deduplicates_invoice_and_applies_currency_rules():
     _append_sfh_summary_sheet(workbook, rows, "Aug - 26 SFH Sales")
     sheet = workbook["SFH"]
 
-    assert sheet.max_row == 6  # title, header, three unique invoices, grand total
+    assert sheet.max_row == 7  # all four sales rows, with invoice tax counted once
+    assert sheet.cell(4, 8).value == 100
+    assert sheet.cell(4, 12).value == 0
     assert [sheet.cell(3, column).value for column in range(1, 14)] == [
         1, 2026, "August", "INV-1", "Web Version", "Course A", 1, 100.0, 0, 0, 100.0, 18.0, 118.0,
     ]
-    assert [sheet.cell(4, column).value for column in range(1, 14)] == [
-        2, 2026, "August", "INV-2", "Web Version", "Course B", 1, 250.0, 0, 0, 250.0, 0.0, 250.0,
-    ]
     assert [sheet.cell(5, column).value for column in range(1, 14)] == [
-        3, 2026, "August", "INV-3", "Web Version", "Course C", 1, 275.0, 0, 0, 275.0, 0.0, 275.0,
+        3, 2026, "August", "INV-2", "Web Version", "Course B", 1, 250.0, 0, 0, 250.0, 0.0, 250.0,
+    ]
+    assert [sheet.cell(6, column).value for column in range(1, 14)] == [
+        4, 2026, "August", "INV-3", "Web Version", "Course C", 1, 275.0, 0, 0, 275.0, 0.0, 275.0,
     ]
 
 
@@ -536,7 +538,7 @@ def test_direct_sales_amount_excludes_cancelled_invoice_status():
 def test_direct_sales_overview_reuses_dashboard_mapping_and_reconciles():
     database = _OverviewDatabase(
         [
-            _direct_row(1, "A", "Bulk Book", 100.4, 11),
+            _direct_row(1, "A", "Bulk Book", 100.4, 11, "Bulk order"),
             _direct_row(2, "B", "Retail Book", 50.4, 2),
             _direct_row(3, "C", "Stall Book", 25.4, 1, "Stall counter"),
         ],
@@ -552,7 +554,7 @@ def test_direct_sales_overview_reuses_dashboard_mapping_and_reconciles():
 
     assert result["validated"] is True
     assert result["totals"] == {
-        "In Office": 50, "Stall": 25, "Bulk": 101,
+        "In Office": 50, "Stall": 25, "Bulk": 100,
         "Call": 0, "Retail": 0, "Language Lab": 0, "Course Promotion": 0,
     }
     assert result["overall_total"] == 176
@@ -561,7 +563,7 @@ def test_direct_sales_overview_reuses_dashboard_mapping_and_reconciles():
 
 def test_direct_sales_overview_reconciles_type_totals_to_overall_total():
     rows = [
-        _direct_row(1, "B-1", "Bulk item", 4186.9, 11),
+        _direct_row(1, "B-1", "Bulk item", 4186.9, 11, "Bulk order"),
         _direct_row(2, "R-1", "Retail item", 69699.3, 1),
         _direct_row(3, "S-1", "Stall item", 38175.37, 1, "STALL"),
     ]
@@ -576,7 +578,11 @@ def test_direct_sales_overview_reconciles_type_totals_to_overall_total():
     )
 
     assert result["overall_total"] == 112062
-    assert sum(result["totals"].values()) == 112062
+    # The dashboard rounds each classification independently and rounds the
+    # overall raw aggregate separately; do not move a rupee between types.
+    assert result["totals"]["Stall"] == 38175
+    assert result["totals"]["In Office"] == 69699
+    assert sum(row["without_tax_total"] for row in result["rows"]) == pytest.approx(112061.57)
 
 
 def test_direct_sales_overview_separates_language_lab_from_retail():
@@ -650,13 +656,13 @@ def test_channel_performance_keeps_call_and_retail_separate():
     assert _direct_sales_channel(_direct_row(2, "R-1", "Retail", 100, 1, "vendant")) == "Retail"
     assert _direct_sales_channel(_direct_row(5, "R-2", "Retail Bulk Qty", 100, 25, "vendant")) == "Retail"
     assert _direct_sales_channel(_direct_row(3, "S-1", "Stall", 100, 1, "stall")) == "Stall"
-    assert _direct_sales_channel(_direct_row(4, "B-1", "Bulk", 100, 11)) == "Bulk"
+    assert _direct_sales_channel(_direct_row(4, "B-1", "Bulk", 100, 1, "Bulk order")) == "Bulk"
 
 
-def test_direct_sales_overview_quantity_over_ten_is_always_bulk():
+def test_direct_sales_overview_preserves_dashboard_stall_precedence_over_bulk():
     row = _direct_row(1, "B-1", "Course Book", 100, 11, "stall course call vendant")
 
-    assert _direct_overview_type(row) == "Bulk"
+    assert _direct_overview_type(row) == "Stall"
     assert _direct_sales_channel(row) == "Stall"
 
 

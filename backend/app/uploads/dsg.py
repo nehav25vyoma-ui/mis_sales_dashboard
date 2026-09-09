@@ -595,10 +595,18 @@ def delete_upload_history(upload_id: str) -> dict[str, object]:
         history = database.get(UploadHistory, upload_id)
         if history is None:
             raise HTTPException(status_code=404, detail="Upload History record not found.")
+        is_direct_sales = history.channel == "DIRECT SALES"
+        dataset_hash = history.dataset_hash
         database.delete(history)
         try:
             database.commit()
         except SQLAlchemyError as exc:
             database.rollback()
             raise HTTPException(status_code=503, detail="The dataset could not be deleted from PostgreSQL.") from exc
+    if is_direct_sales:
+        from app.uploads.direct_sales import DIRECT_SALES_UPLOAD_STORE
+
+        for pending_id, pending in list(DIRECT_SALES_UPLOAD_STORE.items()):
+            if pending_id == upload_id or pending.get("dataset_hash") == dataset_hash:
+                DIRECT_SALES_UPLOAD_STORE.pop(pending_id, None)
     return {"deleted": True, "upload_id": upload_id}

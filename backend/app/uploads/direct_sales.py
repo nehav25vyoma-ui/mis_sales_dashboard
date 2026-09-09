@@ -27,11 +27,11 @@ from app.uploads.dsg import (
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
 DIRECT_SALES_UPLOAD_STORE: dict[str, dict[str, object]] = {}
-DIRECT_SALES_CATEGORIES = (*STANDARD_CATEGORIES, "N/A")
+DIRECT_SALES_CATEGORIES = (*STANDARD_CATEGORIES, "N/A", "Language Lab")
 
 
 class DirectSalesCategoryUpdate(BaseModel):
-    category: Literal["Books", "Web Version", "Audio Device", "Pen Drive", "N/A"]
+    category: Literal["Books", "Web Version", "Audio Device", "Pen Drive", "N/A", "Language Lab"]
 
 AMOUNT_ALIASES = (
     "without tax total",
@@ -66,8 +66,8 @@ def _invoice_key(value: object) -> str:
     return re.sub(r"\.0$", "", text)
 
 
-def _sales_classification(private_notes: object, quantity: object, *text_values: object) -> str:
-    return classify_direct_sale((private_notes, *text_values), quantity)
+def _sales_classification(private_notes: object, quantity: object, *text_values: object, customer_name: object = None) -> str:
+    return classify_direct_sale((private_notes, *text_values), quantity, customer_name=customer_name, private_notes=private_notes)
 
 
 async def _validated_file(file: UploadFile, dataset_label: str) -> tuple[str, bytes, pd.DataFrame]:
@@ -179,6 +179,7 @@ async def upload_direct_sales(
         "Sales Inventory Dataset",
         ("Doc No.", "Category", "Item Details", "Quantity"),
     )
+    client_name_column = _column(invoice, "Client Name")
     dataset_hash = hashlib.sha256(invoice_content + b"\0" + inventory_content).hexdigest()
     with SessionLocal() as database:
         duplicate = database.query(UploadHistory).filter_by(dataset_hash=dataset_hash).first()
@@ -187,8 +188,9 @@ async def upload_direct_sales(
                 status_code=409,
                 detail=f"These Direct Sales datasets were already uploaded. Dataset ID: {duplicate.upload_id}.",
             )
-    if any(item.get("dataset_hash") == dataset_hash for item in DIRECT_SALES_UPLOAD_STORE.values()):
-        raise HTTPException(status_code=409, detail="These Direct Sales datasets are already being reviewed.")
+    for pending_id, pending_upload in DIRECT_SALES_UPLOAD_STORE.items():
+        if pending_upload.get("dataset_hash") == dataset_hash:
+            return _upload_response(pending_id, pending_upload)
 
     invoice = invoice.copy()
     inventory = inventory.copy()
@@ -302,6 +304,7 @@ async def upload_direct_sales(
                 part["quantity"],
                 part["product"],
                 part["category"],
+                customer_name=row.get(client_name_column, ""),
             )
             allocated_rows.append(row)
     matched = pd.DataFrame(allocated_rows)
@@ -339,6 +342,10 @@ async def upload_direct_sales(
         "category_conflicts": category_conflicts,
     }
     DIRECT_SALES_UPLOAD_STORE[upload_id] = upload
+    return _upload_response(upload_id, upload)
+
+
+def _upload_response(upload_id: str, upload: dict[str, object]) -> dict[str, object]:
     category_rows = _category_rows(upload)
     product_groups = _product_groups(upload)
     return {
@@ -346,7 +353,7 @@ async def upload_direct_sales(
         "file_name": upload["file_name"],
         "channel": "DIRECT SALES",
         **upload["counts"],
-        "category_conflicts": len(category_conflicts),
+        "category_conflicts": len(upload["category_conflicts"]),
         "category_review_count": len(category_rows),
         "product_review_count": len(product_groups),
         "required_reviews": {

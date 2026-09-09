@@ -48,8 +48,31 @@ async def upload_amazon_dataset(file: UploadFile = File(...)) -> dict[str, objec
         duplicate = database.query(UploadHistory).filter_by(dataset_hash=dataset_hash).first()
         if duplicate:
             raise HTTPException(status_code=409, detail=f"This dataset was already uploaded. Dataset ID: {duplicate.upload_id}.")
-    if any(item.get("dataset_hash") == dataset_hash for item in AMAZON_UPLOAD_STORE.values()):
-        raise HTTPException(status_code=409, detail="This Amazon dataset is already being reviewed.")
+    existing = next(
+        (
+            (existing_id, item)
+            for existing_id, item in AMAZON_UPLOAD_STORE.items()
+            if item.get("dataset_hash") == dataset_hash
+        ),
+        None,
+    )
+    if existing:
+        existing_id, existing_upload = existing
+        existing_frame = existing_upload["frame"]
+        assert isinstance(existing_frame, pd.DataFrame)
+        groups = _product_groups(existing_upload)
+        return {
+            "upload_id": existing_id,
+            "file_name": existing_upload["file_name"],
+            "channel": "AMAZON",
+            "total_records": len(existing_frame.index),
+            "category_review_count": 0,
+            "product_review_count": len(groups),
+            "required_reviews": {"category": False, "product": bool(groups)},
+            "next_step": "product_review" if groups else "save_dataset",
+            "status": "reviewing",
+            "resumed": True,
+        }
 
     frame = _read_dataset(content, extension)
     if frame.empty:
@@ -114,6 +137,13 @@ async def upload_amazon_dataset(file: UploadFile = File(...)) -> dict[str, objec
 def get_product_review(upload_id: str) -> dict[str, object]:
     groups = _product_groups(_get_upload(upload_id))
     return {"upload_id": upload_id, "groups": groups, "remaining": len(groups), "completed": not groups}
+
+
+@router.delete("/amazon/{upload_id}")
+def discard_upload(upload_id: str) -> dict[str, object]:
+    if AMAZON_UPLOAD_STORE.pop(upload_id, None) is None:
+        raise HTTPException(status_code=404, detail="Amazon upload session not found.")
+    return {"deleted": True, "upload_id": upload_id}
 
 
 @router.patch("/amazon/{upload_id}/product-review/{group_id}")
